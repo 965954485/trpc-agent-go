@@ -226,7 +226,14 @@ func (e *eventEmitter) Context() context.Context {
 	return e.ctx
 }
 
+// emitGracePeriod is the grace period for emitting events after context cancellation.
+// This allows events to be delivered even when the main context is cancelled,
+// ensuring no events are lost during graph shutdown.
+const emitGracePeriod = 5 * time.Second
+
 // emitWithRecover sends an event to the channel with panic recovery.
+// If the original context is cancelled, it will retry with a grace period context
+// to ensure events are not lost during graph shutdown.
 func (e *eventEmitter) emitWithRecover(evt *event.Event) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -235,7 +242,35 @@ func (e *eventEmitter) emitWithRecover(evt *event.Event) (err error) {
 		}
 	}()
 
-	return event.EmitEventWithTimeout(e.ctx, e.eventChan, evt, e.timeout)
+	// First attempt with the original context.
+	err = event.EmitEventWithTimeout(e.ctx, e.eventChan, evt, e.timeout)
+	if err == nil {
+		return nil
+	}
+
+	// If failed due to context cancellation, retry with a grace period context
+	// to ensure the event can still be delivered.
+	if e.ctx.Err() != nil {
+		log.Tracef("EventEmitter: original context cancelled, retrying with grace period: %v", err)
+
+		// Use a fresh context with a grace period to allow event delivery.
+		graceCtx, cancel := context.WithTimeout(context.Background(), emitGracePeriod)
+		defer cancel()
+
+		// Retry with the grace context.
+		gracePeriodTimeout := emitGracePeriod
+		if e.timeout > 0 && e.timeout < emitGracePeriod {
+			gracePeriodTimeout = e.timeout
+		}
+		err = event.EmitEventWithTimeout(graceCtx, e.eventChan, evt, gracePeriodTimeout)
+		if err != nil {
+			// If still failed, it means the channel is likely closed or full.
+			log.Warnf("EventEmitter: failed to emit event during grace period: %v", err)
+		}
+		return nil // Don't propagate error to caller during shutdown.
+	}
+
+	return err
 }
 
 // noopEmitter is a no-op implementation of EventEmitter.
