@@ -234,6 +234,8 @@ func TestEventEmitter_RecoverFromPanic(t *testing.T) {
 		invocationID: "test-invocation",
 	}
 
+>>>>>>> upstream/main
+=======
 	// This should recover from panic and not propagate error
 	err := emitter.EmitCustom("test", nil)
 	assert.NoError(t, err)
@@ -474,3 +476,5 @@ func TestEmitWithRecover_MultipleEventsWithCancelledContext(t *testing.T) {
 	}
 	assert.Equal(t, 5, receivedCount, "all 5 events should be received via grace period")
 }
+=======
+>>>>>>> upstream/main

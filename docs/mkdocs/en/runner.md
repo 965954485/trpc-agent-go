@@ -2,7 +2,7 @@
 
 ## Overview
 
-Runner provides the interface to run Agents, responsible for session management and event stream processing. The core responsibilities of Runner are: obtain or create sessions, generate an Invocation ID, call Agent.Run, process the returned event stream, and append non-partial response events to the session.
+Runner provides the interface to run Agents, responsible for session management and event stream processing. The core responsibilities of Runner are: obtain or create sessions, generate an Invocation ID, call the Agent (via `agent.RunWithPlugins`), process the returned event stream, and append non-partial response events to the session.
 
 ### 🎯 Key Features
 
@@ -11,6 +11,7 @@ Runner provides the interface to run Agents, responsible for session management 
 - **🆔 ID Generation**: Automatically generate Invocation IDs and event IDs.
 - **📊 Observability Integration**: Integrates telemetry/trace to automatically record spans.
 - **✅ Completion Event**: Generates a runner-completion event after the Agent event stream ends.
+- **🔌 Plugins**: Register once on a Runner to apply global hooks across agent, tool, and model lifecycles.
 
 ## Architecture
 
@@ -19,7 +20,7 @@ Runner provides the interface to run Agents, responsible for session management 
 │       Runner        │  - Session management.
 └─────────┬───────────┘  - Event stream processing.
           │
-          │ r.agent.Run(ctx, invocation)
+          │ agent.RunWithPlugins(ctx, invocation, r.agent)
           │
 ┌─────────▼───────────┐
 │       Agent         │  - Receives Invocation.
@@ -153,6 +154,30 @@ r := runner.NewRunner("my-app", agent,
     runner.WithSessionService(sessionService),  // Session service.
 )
 ```
+
+### 🔌 Plugins
+
+Runner plugins are global, runner-scoped hooks. Register plugins once and they
+will apply automatically to all agents, tools, and model calls executed by that
+Runner.
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/plugin"
+
+r := runner.NewRunner("my-app", a,
+    runner.WithPlugins(
+        plugin.NewLogging(),
+        plugin.NewGlobalInstruction("You must follow security policies."),
+    ),
+)
+defer r.Close()
+```
+
+Notes:
+
+- Plugin names must be unique per Runner.
+- Plugins run in the order they are registered.
+- If a plugin implements `plugin.Closer`, Runner will call it in `Close()`.
 
 ### Run Conversation
 
@@ -318,6 +343,38 @@ agent := llmagent.New("assistant",
 // Execute Agent with Runner.
 r := runner.NewRunner("my-app", agent)
 ```
+
+### Switch Agents Per Request
+
+Runner can register multiple optional agents at construction time and pick one per Run:
+
+```go
+reader := llmagent.New("agent1", llmagent.WithModel(model))
+writer := llmagent.New("agent2", llmagent.WithModel(model))
+
+r := runner.NewRunner("my-app", reader, // Use reader as the default agent.
+    runner.WithAgent("writer", writer), // Register an optional agent by name.
+)
+
+// Use the default reader agent.
+ch, err := r.Run(ctx, userID, sessionID, msg)
+
+// Pick the writer agent by name.
+ch, err = r.Run(ctx, userID, sessionID, msg, agent.WithAgentByName("writer"))
+
+// Override with an instance directly (no pre-registration needed).
+custom := llmagent.New("custom", llmagent.WithModel(model))
+ch, err = r.Run(ctx, userID, sessionID, msg, agent.WithAgent(custom))
+```
+
+- `runner.NewRunner("my-app", agent)`: Set the default agent when creating the Runner.
+- `runner.WithAgent("agentName", agent)`: Pre-register an agent by name so later requests can switch via name.
+- `agent.WithAgentByName("agentName")`: Choose a registered agent by name for a single request without changing the default.
+- `agent.WithAgent(agent)`: Provide an agent instance directly for a single request; highest priority and no pre-registration needed.
+
+Agent selection priority: `agent.WithAgent` > `agent.WithAgentByName` > default agent set at construction. 
+
+The selected agent name is used as the event author and is recorded via `appid.RegisterRunner` for observability.
 
 ### Generation Configuration
 

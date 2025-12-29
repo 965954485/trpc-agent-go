@@ -76,14 +76,15 @@ llmAgent := llmagent.New(
 
 LLMAgent 会自动在 `Instruction` 和可选的 `SystemPrompt` 中注入会话状态。支持的占位符语法：
 
-- `{key}`：替换为 `session.State["key"]` 的字符串值
+- `{key}`：替换为会话状态中键 `key` 对应的字符串值（可通过 `invocation.Session.SetState("key", ...)` 或 SessionService 写入）
 - `{key?}`：可选；如果不存在，替换为空字符串
 - `{user:subkey}` / `{app:subkey}` / `{temp:subkey}`：访问用户/应用/临时命名空间（SessionService 会把 app/user 作用域的状态合并进 session，并带上前缀）
+- `{invocation:subkey}` ：替换为fmt.Sprintf("%+v",`invocation.state["subkey"]`)的值，（可以通过invocation.SetState(k,v)来设置）。
 
 注意：
 
 - 对于非可选的 `{key}`，若找不到则保留原样（便于 LLM 感知缺失上下文）
-- 值读取自 `invocation.Session.State`（Runner + SessionService 会自动设置/合并）
+- 值读取自会话状态（Runner + SessionService 会自动设置/合并）
 
 示例：
 
@@ -93,9 +94,13 @@ llm := llmagent.New(
   llmagent.WithModel(modelInstance),
   llmagent.WithInstruction(
     "You are a research assistant. Focus: {research_topics}. " +
-    "User interests: {user:topics?}. App banner: {app:banner?}.",
+    "User interests: {user:topics?}. App banner: {app:banner?}." +
+    "Invocation case: {invocation:case}",
   ),
 )
+
+inv := agent.NewInvoction()
+inv.SetState("case", "case-1")
 
 // 通过 SessionService 初始化状态（用户态/应用态 + 会话本地键）
 _ = sessionService.UpdateUserState(ctx, session.UserKey{AppName: app, UserID: user}, session.StateMap{
@@ -189,7 +194,7 @@ cycleAgent := cycleagent.New(
 )
 
 // 创建 Runner
-runner := runner.NewRunner("demo-app", chainagent)
+runner := runner.NewRunner("demo-app", cycleAgent)
 
 // 直接发送消息，无需创建复杂的 Invocation
 message := model.NewUserMessage("Hello! Can you tell me about yourself?")
@@ -238,6 +243,41 @@ llmAgent := llmagent.New(
     llmagent.WithMessageBranchFilterMode(llmagent.BranchFilterModePrefix),
 )
 ```
+
+### 推理内容模式（DeepSeek 思考模式）
+
+当使用具有思考/推理能力的模型（如 DeepSeek）时，模型会同时输出 `reasoning_content`（思维链）和 `content`（最终回答）。根据 [DeepSeek API 文档](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode)，在多轮对话中，不应将上一轮的 `reasoning_content` 发送给模型。
+
+LLMAgent 提供 `WithReasoningContentMode` 来控制对话历史中 `reasoning_content` 的处理方式：
+
+**可用模式：**
+
+| 模式 | 常量 | 描述 |
+|------|------|------|
+| 丢弃之前轮次 | `ReasoningContentModeDiscardPreviousTurns` | 丢弃之前请求轮次的 `reasoning_content`，保留当前请求的。**（默认，推荐）** |
+| 保留全部 | `ReasoningContentModeKeepAll` | 保留历史中的所有 `reasoning_content`（用于调试）。 |
+| 全部丢弃 | `ReasoningContentModeDiscardAll` | 丢弃历史中的所有 `reasoning_content`，以最大化节省带宽。 |
+
+**使用示例：**
+
+```go
+// DeepSeek 思考模式的推荐配置。
+agent := llmagent.New(
+    "deepseek-agent",
+    llmagent.WithModel(deepseekModel),
+    llmagent.WithInstruction("You are a helpful assistant."),
+    // 丢弃之前轮次的 reasoning_content（推荐用于 DeepSeek）。
+    llmagent.WithReasoningContentMode(llmagent.ReasoningContentModeDiscardPreviousTurns),
+)
+```
+
+**工作原理：**
+
+- **`keep_all`**：所有 `reasoning_content` 都保留在会话历史中。如果需要保留思维链用于调试或分析，请使用此模式。
+- **`discard_previous_turns`**：在构建新请求的消息列表时，属于之前请求的消息的 `reasoning_content` 会被清除。当前请求内的消息（例如在工具调用循环期间）保留其 `reasoning_content`。这遵循 DeepSeek 的建议。
+- **`discard_all`**：在发送给模型之前，所有历史消息的 `reasoning_content` 都会被清除。
+
+**注意：** 此选项仅影响发送给模型之前对历史消息的处理方式。当前响应的 `reasoning_content` 始终会被捕获并存储在会话事件中。
 
 ### 委托可见性选项
 
@@ -701,11 +741,8 @@ _, _ = run.Run(context.Background(), user, sid, model.NewUserMessage("Hi!"))
 callbacks := agent.NewCallbacks()
 callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
   if args.Invocation != nil && args.Invocation.Session != nil {
-    if args.Invocation.Session.State == nil {
-      args.Invocation.Session.State = make(map[string][]byte)
-    }
     // 为"本轮"临时指定指令
-    args.Invocation.Session.State["temp:sys"] = []byte("Translate to French.")
+    args.Invocation.Session.SetState("temp:sys", []byte("Translate to French."))
   }
   return nil, nil
 })
@@ -719,5 +756,5 @@ llm := llmagent.New(
 
 注意事项
 
-- 内存版 `UpdateUserState` 出于安全设计禁止写 `temp:*`；需要临时值时，直接往 `invocation.Session.State` 写（例如通过回调）。
+- 内存版 `UpdateUserState` 出于安全设计禁止写 `temp:*`；需要临时值时，通过 `invocation.Session.SetState` 写入（例如通过回调）。
 - 占位符是在“请求时”解析；只要你换了存储的值，下一次模型请求就会用新值，无需重建 Agent。

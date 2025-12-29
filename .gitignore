@@ -30,6 +30,18 @@ pnpm-lock.yaml
 .gocache
 !.github/scripts/run-go-tests.sh
 .DS_Store
+.codebuddy
+examples/**/*.evalset_result.json
+!examples/evaluation/**/*.evalset_result.json
+>>>>>>> upstream/main
+=======
 .gomodcache
 next-env.d.ts
 .codebuddy
+examples/**/*.evalset_result.json
+!examples/evaluation/**/*.evalset_result.json
+=======
+.codebuddy
+examples/**/*.evalset_result.json
+!examples/evaluation/**/*.evalset_result.json
+>>>>>>> upstream/main

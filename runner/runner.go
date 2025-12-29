@@ -24,11 +24,13 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/artifact"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
+	"trpc.group/trpc-go/trpc-agent-go/internal/state/appender"
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/barrier"
 	"trpc.group/trpc-go/trpc-agent-go/internal/state/flush"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	"trpc.group/trpc-go/trpc-agent-go/plugin"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/telemetry/appid"
@@ -63,6 +65,20 @@ func WithArtifactService(service artifact.Service) Option {
 	}
 }
 
+// WithAgent adds an agent to the runner registry for name-based lookup.
+func WithAgent(name string, ag agent.Agent) Option {
+	return func(opts *Options) {
+		opts.agents[name] = ag
+	}
+}
+
+// WithPlugins registers plugins on the runner.
+func WithPlugins(plugins ...plugin.Plugin) Option {
+	return func(opts *Options) {
+		opts.plugins = append(opts.plugins, plugins...)
+	}
+}
+
 // Runner is the interface for running agents.
 type Runner interface {
 	Run(
@@ -81,11 +97,13 @@ type Runner interface {
 
 // runner runs agents.
 type runner struct {
-	appName         string
-	agent           agent.Agent
-	sessionService  session.Service
-	memoryService   memory.Service
-	artifactService artifact.Service
+	appName          string
+	defaultAgentName string
+	agents           map[string]agent.Agent
+	sessionService   session.Service
+	memoryService    memory.Service
+	artifactService  artifact.Service
+	pluginManager    agent.PluginManager
 
 	// Resource management fields.
 	ownedSessionService bool      // Indicates if sessionService was created by this runner.
@@ -97,32 +115,50 @@ type Options struct {
 	sessionService  session.Service
 	memoryService   memory.Service
 	artifactService artifact.Service
+	agents          map[string]agent.Agent
+	plugins         []plugin.Plugin
+}
+
+// newOptions creates a new Options.
+func newOptions(opt ...Option) Options {
+	opts := Options{
+		agents: make(map[string]agent.Agent),
+	}
+	for _, o := range opt {
+		o(&opts)
+	}
+	return opts
 }
 
 // NewRunner creates a new Runner.
-func NewRunner(appName string, agent agent.Agent, opts ...Option) Runner {
-	var options Options
-
-	// Apply function options.
-	for _, opt := range opts {
-		opt(&options)
-	}
-
+func NewRunner(appName string, ag agent.Agent, opts ...Option) Runner {
+	options := newOptions(opts...)
 	// Track if we created the session service.
 	var ownedSessionService bool
 	if options.sessionService == nil {
 		options.sessionService = inmemory.NewSessionService()
 		ownedSessionService = true
 	}
-	// Register this runner's identity for observability fallback.
-	appid.RegisterRunner(appName, agent.Info().Name)
-
+	agents := options.agents
+	agents[ag.Info().Name] = ag
+	var pm agent.PluginManager
+	if len(options.plugins) > 0 {
+		pm = plugin.MustNewManager(options.plugins...)
+	}
+	// Register the default agent for observability defaults.
+	appid.RegisterRunner(appName, ag.Info().Name)
+	// Register all runner identities for observability fallback.
+	for _, a := range agents {
+		appid.RegisterRunner(appName, a.Info().Name)
+	}
 	return &runner{
 		appName:             appName,
-		agent:               agent,
+		defaultAgentName:    ag.Info().Name,
+		agents:              agents,
 		sessionService:      options.sessionService,
 		memoryService:       options.memoryService,
 		artifactService:     options.artifactService,
+		pluginManager:       pm,
 		ownedSessionService: ownedSessionService,
 	}
 }
@@ -133,6 +169,12 @@ func NewRunner(appName string, agent agent.Agent, opts ...Option) Runner {
 func (r *runner) Close() error {
 	var closeErr error
 	r.closeOnce.Do(func() {
+		if r.pluginManager != nil {
+			if err := r.pluginManager.Close(context.Background()); err != nil {
+				closeErr = err
+				log.Errorf("close plugins failed: %v", err)
+			}
+		}
 		// Only close resources that we own (created by this runner).
 		if r.ownedSessionService && r.sessionService != nil {
 			if err := r.sessionService.Close(); err != nil {
@@ -169,14 +211,21 @@ func (r *runner) Run(
 	for _, opt := range runOpts {
 		opt(&ro)
 	}
+
+	ag, err := r.selectAgent(ctx, ro)
+	if err != nil {
+		return nil, fmt.Errorf("select agent: %w", err)
+	}
+
 	invocation := agent.NewInvocation(
 		agent.WithInvocationSession(sess),
 		agent.WithInvocationMessage(message),
-		agent.WithInvocationAgent(r.agent),
+		agent.WithInvocationAgent(ag),
 		agent.WithInvocationRunOptions(ro),
 		agent.WithInvocationMemoryService(r.memoryService),
 		agent.WithInvocationArtifactService(r.artifactService),
 		agent.WithInvocationEventFilterKey(r.appName),
+		agent.WithInvocationPlugins(r.pluginManager),
 	)
 
 	// If caller provided a history via RunOptions and the session is empty,
@@ -184,7 +233,7 @@ func (r *runner) Run(
 	// and tool calls build on the same canonical transcript.
 	if len(ro.Messages) > 0 && sess.GetEventCount() == 0 {
 		for _, msg := range ro.Messages {
-			author := r.agent.Info().Name
+			author := ag.Info().Name
 			if msg.Role == model.RoleUser {
 				author = authorUser
 			}
@@ -195,6 +244,7 @@ func (r *runner) Run(
 				&model.Response{Done: false, Choices: []model.Choice{{Index: 0, Message: m}}},
 			)
 			agent.InjectIntoEvent(invocation, seedEvt)
+			seedEvt = r.applyEventPlugins(ctx, invocation, seedEvt)
 			if err := r.sessionService.AppendEvent(ctx, sess, seedEvt); err != nil {
 				return nil, err
 			}
@@ -209,6 +259,7 @@ func (r *runner) Run(
 			&model.Response{Done: false, Choices: []model.Choice{{Index: 0, Message: message}}},
 		)
 		agent.InjectIntoEvent(invocation, evt)
+		evt = r.applyEventPlugins(ctx, invocation, evt)
 		if err := r.sessionService.AppendEvent(ctx, sess, evt); err != nil {
 			return nil, err
 		}
@@ -222,17 +273,57 @@ func (r *runner) Run(
 	// Create flush channel and attach flusher before agent.Run to ensure cloned invocations inherit it.
 	flushChan := make(chan *flush.FlushRequest)
 	flush.Attach(ctx, invocation, flushChan)
+	appender.Attach(invocation, func(ctx context.Context, e *event.Event) error {
+		if e == nil {
+			return nil
+		}
+		return r.sessionService.AppendEvent(ctx, sess, e)
+	})
 	barrier.Enable(invocation)
 
 	// Run the agent and get the event channel.
-	agentEventCh, err := r.agent.Run(ctx, invocation)
+	agentEventCh, err := agent.RunWithPlugins(ctx, invocation, ag)
 	if err != nil {
+		// Attempt to persist the error event so the session reflects the failure.
+		errorEvent := event.NewErrorEvent(
+			invocation.InvocationID,
+			ag.Info().Name,
+			model.ErrorTypeRunError,
+			err.Error(),
+		)
+		// Populate content to ensure it is valid for persistence (and viewable by users).
+		ensureErrorEventContent(errorEvent)
+		errorEvent = r.applyEventPlugins(ctx, invocation, errorEvent)
+
+		if appendErr := r.sessionService.AppendEvent(ctx, sess, errorEvent); appendErr != nil {
+			log.Errorf("failed to append agent run error event: %v", appendErr)
+		}
+
 		invocation.CleanupNotice(ctx)
 		return nil, err
 	}
 
 	// Process the agent events and emit them to the output channel.
 	return r.processAgentEvents(ctx, sess, invocation, agentEventCh, flushChan), nil
+}
+
+// resolveAgent decides which agent to use for this run.
+func (r *runner) selectAgent(
+	_ context.Context,
+	ro agent.RunOptions,
+) (agent.Agent, error) {
+	if ro.Agent != nil {
+		appid.RegisterRunner(r.appName, ro.Agent.Info().Name)
+		return ro.Agent, nil
+	}
+	agentName := r.defaultAgentName
+	if ro.AgentByName != "" {
+		agentName = ro.AgentByName
+	}
+	if ag, ok := r.agents[agentName]; ok && ag != nil {
+		return ag, nil
+	}
+	return nil, fmt.Errorf("runner: agent %q not found", agentName)
 }
 
 // getOrCreateSession returns an existing session or creates a new one.
@@ -258,6 +349,7 @@ type eventLoopContext struct {
 	processedEventCh chan *event.Event
 	finalStateDelta  map[string][]byte
 	finalChoices     []model.Choice
+	assistantContent map[string]struct{}
 }
 
 // processAgentEvents consumes agent events, persists to session, and emits.
@@ -275,6 +367,7 @@ func (r *runner) processAgentEvents(
 		agentEventCh:     agentEventCh,
 		flushChan:        flushChan,
 		processedEventCh: processedEventCh,
+		assistantContent: make(map[string]struct{}),
 	}
 	runCtx := agent.CloneContext(ctx)
 	go r.runEventLoop(runCtx, loop)
@@ -291,6 +384,7 @@ func (r *runner) runEventLoop(ctx context.Context, loop *eventLoopContext) {
 		r.safeEmitRunnerCompletion(ctx, loop)
 		// Disable further flush requests for this invocation.
 		flush.Clear(loop.invocation)
+		appender.Clear(loop.invocation)
 		close(loop.processedEventCh)
 		loop.invocation.CleanupNotice(ctx)
 	}()
@@ -332,6 +426,10 @@ func (r *runner) processSingleAgentEvent(ctx context.Context, loop *eventLoopCon
 		return nil
 	}
 
+	agentEvent = r.applyEventPlugins(ctx, loop.invocation, agentEvent)
+
+	r.recordAssistantContent(loop, agentEvent)
+
 	// Append qualifying events to session and trigger summarization.
 	r.handleEventPersistence(ctx, loop.sess, agentEvent)
 
@@ -352,6 +450,78 @@ func (r *runner) processSingleAgentEvent(ctx context.Context, loop *eventLoopCon
 	}
 
 	return nil
+}
+
+func (r *runner) applyEventPlugins(
+	ctx context.Context,
+	invocation *agent.Invocation,
+	e *event.Event,
+) *event.Event {
+	if e == nil {
+		return nil
+	}
+	if invocation == nil || invocation.Plugins == nil {
+		return e
+	}
+	updated, err := invocation.Plugins.OnEvent(ctx, invocation, e)
+	if err != nil {
+		log.ErrorfContext(ctx, "plugin OnEvent failed: %v", err)
+		return e
+	}
+	if updated == nil {
+		return e
+	}
+	copyEventInvocationFields(updated, e)
+	return updated
+}
+
+func copyEventInvocationFields(dst *event.Event, src *event.Event) {
+	if dst == nil || src == nil {
+		return
+	}
+	if dst.RequestID == "" {
+		dst.RequestID = src.RequestID
+	}
+	if dst.InvocationID == "" {
+		dst.InvocationID = src.InvocationID
+	}
+	if dst.ParentInvocationID == "" {
+		dst.ParentInvocationID = src.ParentInvocationID
+	}
+	if dst.Branch == "" {
+		dst.Branch = src.Branch
+	}
+	if dst.FilterKey == "" {
+		dst.FilterKey = src.FilterKey
+	}
+}
+
+func (r *runner) recordAssistantContent(loop *eventLoopContext, e *event.Event) {
+	if loop == nil || e == nil || e.Response == nil {
+		return
+	}
+	if loop.invocation == nil {
+		return
+	}
+	if loop.assistantContent == nil {
+		loop.assistantContent = make(map[string]struct{})
+	}
+	if isGraphCompletionEvent(e) {
+		return
+	}
+	if e.IsPartial || !e.IsValidContent() {
+		return
+	}
+	for _, choice := range e.Response.Choices {
+		msg := choice.Message
+		if msg.Role != model.RoleAssistant {
+			continue
+		}
+		if msg.Content == "" {
+			continue
+		}
+		loop.assistantContent[msg.Content] = struct{}{}
+	}
 }
 
 // safeEmitRunnerCompletion guards emitRunnerCompletion against panics from session services.
@@ -392,6 +562,9 @@ func (r *runner) handleEventPersistence(
 	sess *session.Session,
 	agentEvent *event.Event,
 ) {
+	// Ensure error events have content so they are valid for persistence.
+	ensureErrorEventContent(agentEvent)
+
 	// Append event to session if it's complete (not partial).
 	if !r.shouldPersistEvent(agentEvent) {
 		return
@@ -427,9 +600,9 @@ func (r *runner) handleEventPersistence(
 	// Use EnqueueSummaryJob for true asynchronous processing.
 	// Prefer filter-specific summarization to avoid scanning all filters.
 	if err := r.sessionService.EnqueueSummaryJob(
-		context.Background(), sess, agentEvent.FilterKey, false,
+		ctx, sess, agentEvent.FilterKey, false,
 	); err != nil {
-		log.Debugf("Auto summarize after append skipped or failed: %v.", err)
+		log.DebugfContext(ctx, "Auto summarize after append skipped or failed: %v.", err)
 	}
 	// Do not enqueue full-session summary here. The worker will cascade
 	// a full-session summarization after a branch update when appropriate.
@@ -490,9 +663,22 @@ func (r *runner) emitRunnerCompletion(ctx context.Context, loop *eventLoopContex
 		},
 	)
 
+	agent.InjectIntoEvent(loop.invocation, runnerCompletionEvent)
+	runnerCompletionEvent = r.applyEventPlugins(
+		ctx,
+		loop.invocation,
+		runnerCompletionEvent,
+	)
+
 	// Propagate graph-level completion data if available.
 	if len(loop.finalStateDelta) > 0 {
-		r.propagateGraphCompletion(runnerCompletionEvent, loop.finalStateDelta, loop.finalChoices)
+		includeChoices := r.shouldIncludeFinalChoices(loop)
+		r.propagateGraphCompletion(
+			runnerCompletionEvent,
+			loop.finalStateDelta,
+			loop.finalChoices,
+			includeChoices,
+		)
 	}
 
 	// Append runner completion event to session.
@@ -510,6 +696,7 @@ func (r *runner) propagateGraphCompletion(
 	runnerCompletionEvent *event.Event,
 	finalStateDelta map[string][]byte,
 	finalChoices []model.Choice,
+	includeChoices bool,
 ) {
 	// Initialize state delta map if needed.
 	if runnerCompletionEvent.StateDelta == nil {
@@ -529,7 +716,8 @@ func (r *runner) propagateGraphCompletion(
 
 	// Optionally echo the final text as a non-streaming assistant message
 	// if graph provided it in its completion.
-	if runnerCompletionEvent.Response != nil &&
+	if includeChoices &&
+		runnerCompletionEvent.Response != nil &&
 		len(runnerCompletionEvent.Response.Choices) == 0 &&
 		len(finalChoices) > 0 {
 		// Keep only content to avoid carrying tool deltas etc.
@@ -537,6 +725,31 @@ func (r *runner) propagateGraphCompletion(
 		b, _ := json.Marshal(finalChoices)
 		_ = json.Unmarshal(b, &runnerCompletionEvent.Response.Choices)
 	}
+}
+
+func (r *runner) shouldIncludeFinalChoices(loop *eventLoopContext) bool {
+	if loop == nil {
+		return true
+	}
+	if len(loop.finalChoices) == 0 {
+		return false
+	}
+	if len(loop.assistantContent) == 0 {
+		return true
+	}
+	for _, choice := range loop.finalChoices {
+		msg := choice.Message
+		if msg.Role != model.RoleAssistant {
+			continue
+		}
+		if msg.Content == "" {
+			continue
+		}
+		if _, ok := loop.assistantContent[msg.Content]; ok {
+			return false
+		}
+	}
+	return true
 }
 
 // shouldAppendUserMessage checks if the incoming user message should be appended to the session.
@@ -554,6 +767,40 @@ func shouldAppendUserMessage(message model.Message, seed []model.Message) bool {
 		return !model.MessagesEqual(seed[i], message)
 	}
 	return true
+}
+
+// ensureErrorEventContent ensures that error events have valid content.
+// This is necessary because some models return error responses without content,
+// which would otherwise be discarded by the session service.
+func ensureErrorEventContent(e *event.Event) {
+	if e == nil || e.Response == nil || e.Response.Error == nil {
+		return
+	}
+	// If content is valid (non-empty), do nothing.
+	if e.IsValidContent() {
+		return
+	}
+
+	// Ensure Choices slice exists
+	if len(e.Response.Choices) == 0 {
+		e.Response.Choices = []model.Choice{{
+			Index: 0,
+			Message: model.Message{
+				Role: model.RoleAssistant,
+			},
+		}}
+	}
+
+	// Populate content if empty
+	if e.Response.Choices[0].Message.Content == "" {
+		e.Response.Choices[0].Message.Content = "An error occurred during execution. Please contact the service provider."
+	}
+
+	// Ensure FinishReason is set
+	if e.Response.Choices[0].FinishReason == nil {
+		reason := "error"
+		e.Response.Choices[0].FinishReason = &reason
+	}
 }
 
 // RunWithMessages is a convenience helper that lets callers pass a full

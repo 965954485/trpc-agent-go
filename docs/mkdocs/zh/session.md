@@ -255,18 +255,29 @@ summarizer := summary.NewSummarizer(
 
 **上下文注入机制：**
 
-启用摘要后，框架会将摘要作为系统消息前置到 LLM 输入，同时包含摘要时间点之后的所有增量事件，保证完整上下文：
+启用摘要后，框架会将摘要作为独立的系统消息插入到第一个现有系统消息之后，同时包含摘要时间点之后的所有增量事件，保证完整上下文：
 
 ```
+When AddSessionSummary = true:
 ┌─────────────────────────────────────────┐
-│ System Prompt                           │
+│ Existing System Message (optional)      │ ← 如果存在
 ├─────────────────────────────────────────┤
-│ Session Summary (system message)        │ ← Compressed history
+│ Session Summary (system message)        │ ← 插入到第一个系统消息之后
 ├─────────────────────────────────────────┤
 │ Event 1 (after summary)                 │ ┐
 │ Event 2                                 │ │
-│ Event 3                                 │ │ New events
-│ ...                                     │ │ (fully retained)
+│ Event 3                                 │ │ 摘要后的所有增量事件
+│ ...                                     │ │ （完整保留）
+│ Event N (current message)               │ ┘
+└─────────────────────────────────────────┘
+
+When AddSessionSummary = false:
+┌─────────────────────────────────────────┐
+│ System Prompt                           │
+├─────────────────────────────────────────┤
+│ Event N-k+1                             │ ┐
+│ Event N-k+2                             │ │ 最近 k 轮对话
+│ ...                                     │ │ （当 MaxHistoryRuns=k 时）
 │ Event N (current message)               │ ┘
 └─────────────────────────────────────────┘
 ```
@@ -525,10 +536,11 @@ summary:{appName}:{userID}:{sessionID}:{filterKey} -> String (JSON)
 **连接配置：**
 
 方式一：
+
 - **`WithPostgresClientDSN(dsn string)`**：PostgreSQL DSN。 示例：`postgres://user:password@localhost:5432/dbname`
 
-
 方式二：
+
 - **`WithHost(host string)`**：PostgreSQL 服务器地址。默认值为 `localhost`。
 - **`WithPort(port int)`**：PostgreSQL 服务器端口。默认值为 `5432`。
 - **`WithUser(user string)`**：数据库用户名。默认值为 `postgres`。
@@ -537,6 +549,7 @@ summary:{appName}:{userID}:{sessionID}:{filterKey} -> String (JSON)
 - **`WithSSLMode(sslMode string)`**：SSL 模式。默认值为 `disable`。可选值：`disable`、`require`、`verify-ca`、`verify-full`。
 
 方式三：
+
 - **`WithPostgresInstance(name string)`**：使用预配置的 PostgreSQL 实例。
 
 优先级：方式一 > 方式二 > 方式三
@@ -678,10 +691,10 @@ sessionService, err := postgres.NewService(
 
 **删除行为对比：**
 
-| 配置               | 删除操作                        | 查询行为                  | 数据恢复 |
-| ------------------ | ------------------------------- | ------------------------- | -------- |
+| 配置               | 删除操作                        | 查询行为                                                | 数据恢复 |
+| ------------------ | ------------------------------- | ------------------------------------------------------- | -------- |
 | `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | 查询附带 `WHERE deleted_at IS NULL`，仅返回未软删除数据 | 可恢复   |
-| `softDelete=false` | `DELETE FROM ...`               | 查询所有记录              | 不可恢复 |
+| `softDelete=false` | `DELETE FROM ...`               | 查询所有记录                                            | 不可恢复 |
 
 **TTL 自动清理：**
 
@@ -718,95 +731,8 @@ sessionService, err := postgres.NewService(
 
 ### 存储结构
 
-PostgreSQL 使用关系型表结构，JSON 数据使用 JSONB 类型存储：
 
-```sql
--- 会话状态表
-CREATE TABLE session_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    state JSONB,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- 部分唯一索引（只对未删除记录生效）
-CREATE UNIQUE INDEX idx_session_states_unique_active
-ON session_states(app_name, user_id, session_id)
-WHERE deleted_at IS NULL;
-
--- 会话事件表
-CREATE TABLE session_events (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    event JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- 轨迹事件表
-CREATE TABLE session_track_events (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    track VARCHAR(255) NOT NULL,
-    event JSONB NOT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP
-);
-
--- 会话摘要表
-CREATE TABLE session_summaries (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    filter_key VARCHAR(255) NOT NULL,
-    summary JSONB NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, user_id, session_id, filter_key)
-);
-
--- 应用状态表
-CREATE TABLE app_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    key VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, key)
-);
-
--- 用户状态表
-CREATE TABLE user_states (
-    id BIGSERIAL PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    key VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    expires_at TIMESTAMP,
-    deleted_at TIMESTAMP,
-    UNIQUE(app_name, user_id, key)
-);
-```
+完整的表定义请参考 [session/postgres/schema.sql](https://github.com/trpc-group/trpc-agent-go/blob/main/session/postgres/schema.sql)
 
 ## MySQL 存储
 
@@ -936,10 +862,10 @@ sessionService, err := mysql.NewService(
 
 **删除行为对比：**
 
-| 配置               | 删除操作                        | 查询行为                  | 数据恢复 |
-| ------------------ | ------------------------------- | ------------------------- | -------- |
+| 配置               | 删除操作                        | 查询行为                                                | 数据恢复 |
+| ------------------ | ------------------------------- | ------------------------------------------------------- | -------- |
 | `softDelete=true`  | `UPDATE SET deleted_at = NOW()` | 查询附带 `WHERE deleted_at IS NULL`，仅返回未软删除数据 | 可恢复   |
-| `softDelete=false` | `DELETE FROM ...`               | 查询所有记录              | 不可恢复 |
+| `softDelete=false` | `DELETE FROM ...`               | 查询所有记录                                            | 不可恢复 |
 
 **TTL 自动清理：**
 
@@ -975,84 +901,9 @@ sessionService, err := mysql.NewService(
 
 ### 存储结构
 
-MySQL 使用关系型表结构，JSON 数据使用 JSON 类型存储：
 
-```sql
--- 会话状态表
-CREATE TABLE session_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    state JSON,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_session_states_unique (app_name, user_id, session_id, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+完整的表定义请参考 [session/mysql/schema.sql](https://github.com/trpc-group/trpc-agent-go/blob/main/session/mysql/schema.sql)
 
--- 会话事件表
-CREATE TABLE session_events (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    event JSON NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    KEY idx_session_events (app_name, user_id, session_id, deleted_at, created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- 会话摘要表
-CREATE TABLE session_summaries (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    session_id VARCHAR(255) NOT NULL,
-    filter_key VARCHAR(255) NOT NULL,
-    summary JSON NOT NULL,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_session_summaries_unique (app_name, user_id, session_id, filter_key, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- 应用状态表
-CREATE TABLE app_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    `key` VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_app_states_unique (app_name, `key`, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- 用户状态表
-CREATE TABLE user_states (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    app_name VARCHAR(255) NOT NULL,
-    user_id VARCHAR(255) NOT NULL,
-    `key` VARCHAR(255) NOT NULL,
-    value TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NULL,
-    deleted_at TIMESTAMP NULL,
-    UNIQUE KEY idx_user_states_unique (app_name, user_id, `key`, deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-```
-
-**MySQL 与 PostgreSQL 的关键差异：**
-
-- MySQL 不支持 `WHERE deleted_at IS NULL` 的 partial index，需要将 `deleted_at` 包含在唯一索引中
-- MySQL 使用 `JSON` 类型而非 `JSONB`（功能类似，但存储格式不同）
-- MySQL 使用 `ON DUPLICATE KEY UPDATE` 语法实现 UPSERT
 
 ## 高级用法
 
@@ -1113,6 +964,154 @@ sess, err := sessionService.GetSession(ctx, key,
 sess, err := sessionService.GetSession(ctx, key,
     session.WithEventTime(time.Now().Add(-1*time.Hour)))
 ```
+
+#### 直接追加事件到会话
+
+在某些场景下，您可能需要直接将事件追加到会话中，而不调用模型。这在以下场景中很有用：
+
+- 从外部源预加载对话历史
+- 在首次用户查询前插入系统消息或上下文
+- 将用户操作或元数据记录为事件
+- 以编程方式构建对话上下文
+
+**重要提示**：Event 既可以表示用户请求，也可以表示模型响应。当您使用 `Runner.Run()` 时，框架会自动为用户消息和助手回复创建事件。
+
+**示例：追加用户消息**
+
+```go
+import (
+    "context"
+    "github.com/google/uuid"
+    "trpc.group/trpc-go/trpc-agent-go/event"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/session"
+)
+
+// 获取或创建会话
+sessionKey := session.Key{
+    AppName:   "my-agent",
+    UserID:    "user123",
+    SessionID: "session-123",
+}
+sess, err := sessionService.GetSession(ctx, sessionKey)
+if err != nil {
+    return err
+}
+if sess == nil {
+    sess, err = sessionService.CreateSession(ctx, sessionKey, session.StateMap{})
+    if err != nil {
+        return err
+    }
+}
+
+// 创建用户消息
+message := model.NewUserMessage("你好，我正在学习 Go 编程。")
+
+// 创建事件，必填字段：
+// - invocationID: 唯一标识符（必填）
+// - author: 事件作者，用户消息使用 "user"（必填）
+// - response: *model.Response，包含 Choices 和 Message（必填）
+invocationID := uuid.New().String()
+evt := event.NewResponseEvent(
+    invocationID, // 必填：唯一调用标识符
+    "user",       // 必填：事件作者
+    &model.Response{
+        Done: false, // 推荐：非最终事件设为 false
+        Choices: []model.Choice{
+            {
+                Index:   0,       // 必填：选择索引
+                Message: message, // 必填：包含 Content 或 ContentParts 的消息
+            },
+        },
+    },
+)
+evt.RequestID = uuid.New().String() // 可选：用于追踪
+
+// 追加事件到会话
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return fmt.Errorf("append event failed: %w", err)
+}
+```
+
+**示例：追加系统消息**
+
+```go
+systemMessage := model.Message{
+    Role:    model.RoleSystem,
+    Content: "你是一个专门帮助 Go 编程的助手。",
+}
+
+evt := event.NewResponseEvent(
+    uuid.New().String(),
+    "system", // 系统消息的作者
+    &model.Response{
+        Done:    false,
+        Choices: []model.Choice{{Index: 0, Message: systemMessage}},
+    },
+)
+
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return err
+}
+```
+
+**示例：追加助手消息**
+
+```go
+assistantMessage := model.Message{
+    Role:    model.RoleAssistant,
+    Content: "Go 是一种静态类型、编译型的编程语言。",
+}
+
+evt := event.NewResponseEvent(
+    uuid.New().String(),
+    "assistant", // 助手消息的作者（或使用 agent 名称）
+    &model.Response{
+        Done:    false,
+        Choices: []model.Choice{{Index: 0, Message: assistantMessage}},
+    },
+)
+
+if err := sessionService.AppendEvent(ctx, sess, evt); err != nil {
+    return err
+}
+```
+
+**Event 必填字段**
+
+使用 `event.NewResponseEvent()` 创建事件时，以下字段是必填的：
+
+1. **函数参数**：
+   - `invocationID` (string): 唯一标识符，通常使用 `uuid.New().String()`
+   - `author` (string): 事件作者（`"user"`、`"system"` 或 agent 名称）
+   - `response` (*model.Response): 包含 Choices 的响应对象
+
+2. **Response 字段**：
+   - `Choices` ([]model.Choice): 至少包含一个 Choice，包含 `Index` 和 `Message`
+   - `Message`: 必须包含 `Content` 或 `ContentParts`
+
+3. **自动生成字段**（由 `event.NewResponseEvent()` 自动设置）：
+   - `ID`: 自动生成的 UUID
+   - `Timestamp`: 自动设置为当前时间
+   - `Version`: 自动设置为 `CurrentVersion`
+
+4. **持久化要求**：
+   - `Response != nil`
+   - `!IsPartial`（或包含 `StateDelta`）
+   - `IsValidContent()` 返回 `true`
+
+**与 Runner 配合使用**
+
+当您后续使用 `Runner.Run()` 处理同一会话时：
+
+1. Runner 会自动加载会话（包括所有已追加的事件）
+2. 将会话事件转换为消息
+3. 将所有消息（已追加的 + 当前的）包含在对话上下文中
+4. 一起发送给模型
+
+所有已追加的事件都会成为对话历史的一部分，并在后续交互中可供模型使用。
+
+**示例**：见 `examples/session/appendevent`（[代码](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/session/appendevent)）
 
 ## 会话摘要
 
@@ -1327,7 +1326,7 @@ llmagent.WithAddSessionSummary(true)
 
 **工作方式：**
 
-- 摘要作为系统消息自动前置到 LLM 输入
+- 会话摘要作为独立的系统消息插入到第一个现有系统消息之后（如果没有系统消息则前置添加）
 - 包含摘要时间点之后的**所有增量事件**（不截断）
 - 保证完整上下文：浓缩历史 + 完整新对话
 - **`WithMaxHistoryRuns` 参数被忽略**

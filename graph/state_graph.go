@@ -18,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
@@ -383,15 +383,22 @@ func WithModelCallbacks(callbacks *model.Callbacks) Option {
 // The name and description of the node can be set with the options.
 // This automatically sets up Pregel-style channel configuration.
 func (sg *StateGraph) AddNode(id string, function NodeFunc, opts ...Option) *StateGraph {
+	f := func(ctx context.Context, state State) (any, error) {
+		ctx, span := trace.Tracer.Start(ctx, itelemetry.NewWorkflowSpanName(fmt.Sprintf("execute_function_node %s", id)))
+		itelemetry.TraceWorkflow(span, &itelemetry.Workflow{Name: fmt.Sprintf("execute_function_node %s", id), ID: id})
+		defer span.End()
+		return function(ctx, state)
+	}
 	node := &Node{
 		ID:       id,
 		Name:     id,
-		Function: function,
+		Function: f,
 		Type:     NodeTypeFunction, // Default to function type
 	}
 	for _, opt := range opts {
 		opt(node)
 	}
+
 	sg.graph.addNode(node)
 
 	// Automatically set up Pregel-style configuration
@@ -735,7 +742,8 @@ func NewLLMNodeFunc(
 		defer span.End()
 		result, err := runner.execute(ctx, state, span)
 		if err != nil {
-			span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return nil, fmt.Errorf("failed to run model: %w", err)
 		}
 		return result, nil
@@ -1024,58 +1032,189 @@ type modelResponseConfig struct {
 	NodeID string
 }
 
+func responseModelError(rsp *model.Response) error {
+	if rsp == nil || rsp.Error == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %s", rsp.Error.Type, rsp.Error.Message)
+}
+
+func applyAfterModelPluginCallbacks(
+	ctx context.Context,
+	args *model.AfterModelArgs,
+	span oteltrace.Span,
+) (context.Context, bool, *model.Response, error) {
+	invocation, ok := agent.InvocationFromContext(ctx)
+	if !ok || invocation == nil || invocation.Plugins == nil {
+		return ctx, false, nil, nil
+	}
+
+	callbacks := invocation.Plugins.ModelCallbacks()
+	if callbacks == nil {
+		return ctx, false, nil, nil
+	}
+
+	result, err := callbacks.RunAfterModel(ctx, args)
+	if err != nil {
+		span.SetAttributes(
+			attribute.String("trpc.go.agent.error", err.Error()),
+		)
+		return ctx, false, nil, fmt.Errorf(
+			"callback after model error: %w",
+			err,
+		)
+	}
+
+	if result != nil && result.Context != nil {
+		ctx = result.Context
+	}
+	if result != nil && result.CustomResponse != nil {
+		return ctx, true, result.CustomResponse, nil
+	}
+	return ctx, false, nil, nil
+}
+
+func applyAfterModelCallbacks(
+	ctx context.Context,
+	callbacks *model.Callbacks,
+	args *model.AfterModelArgs,
+	span oteltrace.Span,
+) (context.Context, *model.Response, error) {
+	if callbacks == nil {
+		return ctx, nil, nil
+	}
+
+	result, err := callbacks.RunAfterModel(ctx, args)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		span.SetAttributes(
+			attribute.String("trpc.go.agent.error", err.Error()),
+		)
+		return ctx, nil, fmt.Errorf(
+			"callback after model error: %w",
+			err,
+		)
+	}
+
+	if result != nil && result.Context != nil {
+		ctx = result.Context
+	}
+	if result != nil && result.CustomResponse != nil {
+		return ctx, result.CustomResponse, nil
+	}
+	return ctx, nil, nil
+}
+
+func modelResponseAuthor(config modelResponseConfig) string {
+	if config.NodeID != "" {
+		return config.NodeID
+	}
+	return config.LLMModel.Info().Name
+}
+
+func emitModelResponseEvent(
+	ctx context.Context,
+	config modelResponseConfig,
+	ev *event.Event,
+) error {
+	if config.EventChan == nil || !shouldEmitModelResponse(config.Response) {
+		return nil
+	}
+
+	invocation, ok := agent.InvocationFromContext(ctx)
+	if !ok {
+		invocation = agent.NewInvocation(
+			agent.WithInvocationID(config.InvocationID),
+			agent.WithInvocationModel(config.LLMModel),
+			agent.WithInvocationSession(
+				&session.Session{ID: config.SessionID},
+			),
+		)
+	}
+	return agent.EmitEvent(ctx, invocation, config.EventChan, ev)
+}
+
 // processModelResponse processes a single model response.
 func processModelResponse(ctx context.Context, config modelResponseConfig) (context.Context, *event.Event, error) {
-	if config.ModelCallbacks != nil {
-		// Convert response.Error to Go error for callback.
-		var modelErr error
-		if config.Response != nil && config.Response.Error != nil {
-			modelErr = fmt.Errorf("%s: %s", config.Response.Error.Type, config.Response.Error.Message)
-		}
+	args := &model.AfterModelArgs{
+		Request:  config.Request,
+		Response: config.Response,
+		Error:    responseModelError(config.Response),
+	}
 
-		args := &model.AfterModelArgs{
-			Request:  config.Request,
-			Response: config.Response,
-			Error:    modelErr,
-		}
-		result, err := config.ModelCallbacks.RunAfterModel(ctx, args)
+	ctx, pluginOverride, customResponse, err := applyAfterModelPluginCallbacks(
+		ctx,
+		args,
+		config.Span,
+	)
+	if err != nil {
+		return ctx, nil, err
+	}
+	if pluginOverride {
+		config.Response = customResponse
+		args.Response = config.Response
+	}
+
+	if !pluginOverride {
+		ctx, customResponse, err = applyAfterModelCallbacks(
+			ctx,
+			config.ModelCallbacks,
+			args,
+			config.Span,
+		)
 		if err != nil {
-			config.Span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
-			return ctx, nil, fmt.Errorf("callback after model error: %w", err)
-		}
-		// Use the context from result if provided for subsequent operations.
-		if result != nil && result.Context != nil {
-			ctx = result.Context
-		}
-		if result != nil && result.CustomResponse != nil {
-			config.Response = result.CustomResponse
-		}
-	}
-	var llmEvent *event.Event
-	author := config.LLMModel.Info().Name
-	if config.NodeID != "" {
-		author = config.NodeID
-	}
-	llmEvent = event.NewResponseEvent(config.InvocationID, author, config.Response)
-	if config.EventChan != nil && !config.Response.Done {
-		invocation, ok := agent.InvocationFromContext(ctx)
-		if !ok {
-			invocation = agent.NewInvocation(
-				agent.WithInvocationID(config.InvocationID),
-				agent.WithInvocationModel(config.LLMModel),
-				agent.WithInvocationSession(&session.Session{ID: config.SessionID}),
-			)
-		}
-
-		if err := agent.EmitEvent(ctx, invocation, config.EventChan, llmEvent); err != nil {
 			return ctx, nil, err
 		}
+		if customResponse != nil {
+			config.Response = customResponse
+		}
 	}
+
+	llmEvent := event.NewResponseEvent(
+		config.InvocationID,
+		modelResponseAuthor(config),
+		config.Response,
+	)
+
+	if err := emitModelResponseEvent(ctx, config, llmEvent); err != nil {
+		return ctx, nil, err
+	}
+
 	if config.Response.Error != nil {
-		config.Span.SetAttributes(attribute.String("trpc.go.agent.error", config.Response.Error.Message))
-		return ctx, nil, fmt.Errorf("model API error: %s", config.Response.Error.Message)
+		config.Span.SetAttributes(
+			attribute.String(
+				"trpc.go.agent.error",
+				config.Response.Error.Message,
+			),
+		)
+		return ctx, nil, fmt.Errorf(
+			"model API error: %s",
+			config.Response.Error.Message,
+		)
 	}
 	return ctx, llmEvent, nil
+}
+
+func shouldEmitModelResponse(rsp *model.Response) bool {
+	if rsp == nil {
+		return false
+	}
+	if rsp.Error != nil {
+		return true
+	}
+	if rsp.IsValidContent() {
+		return true
+	}
+	for _, choice := range rsp.Choices {
+		if choice.Message.ReasoningContent != "" {
+			return true
+		}
+		if choice.Delta.ReasoningContent != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func runModel(
@@ -1092,11 +1231,39 @@ func runModel(
 		attribute.String("trpc.go.agent.model_name", llmModel.Info().Name),
 	)
 
+	if invocation, ok := agent.InvocationFromContext(ctx); ok &&
+		invocation != nil && invocation.Plugins != nil {
+		callbacks := invocation.Plugins.ModelCallbacks()
+		if callbacks != nil {
+			args := &model.BeforeModelArgs{Request: request}
+			result, err := callbacks.RunBeforeModel(ctx, args)
+			if err != nil {
+				span.SetAttributes(
+					attribute.String("trpc.go.agent.error", err.Error()),
+				)
+				return ctx, nil, fmt.Errorf(
+					"callback before model error: %w",
+					err,
+				)
+			}
+			if result != nil && result.Context != nil {
+				ctx = result.Context
+			}
+			if result != nil && result.CustomResponse != nil {
+				responseChan := make(chan *model.Response, 1)
+				responseChan <- result.CustomResponse
+				close(responseChan)
+				return ctx, responseChan, nil
+			}
+		}
+	}
+
 	if modelCallbacks != nil {
 		args := &model.BeforeModelArgs{Request: request}
 		result, err := modelCallbacks.RunBeforeModel(ctx, args)
 		if err != nil {
-			span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 			return ctx, nil, fmt.Errorf("callback before model error: %w", err)
 		}
 		// Use the context from result if provided.
@@ -1113,7 +1280,8 @@ func runModel(
 	// Generate content.
 	responseChan, err := llmModel.GenerateContent(ctx, request)
 	if err != nil {
-		span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return ctx, nil, fmt.Errorf("failed to generate content: %w", err)
 	}
 	return ctx, responseChan, nil
@@ -1144,7 +1312,8 @@ func NewToolsNodeFunc(tools map[string]tool.Tool, opts ...Option) NodeFunc {
 	parallel := node.enableParallelTools
 
 	return func(ctx context.Context, state State) (any, error) {
-		ctx, span := trace.Tracer.Start(ctx, "execute_tools_node")
+		ctx, span := trace.Tracer.Start(ctx, itelemetry.NewWorkflowSpanName("execute_tools_node"))
+		itelemetry.TraceWorkflow(span, &itelemetry.Workflow{Name: "execute_tools_node", ID: "execute_tools_node"})
 		defer span.End()
 
 		// Extract and validate messages from state.
@@ -1219,9 +1388,15 @@ func NewAgentNodeFunc(agentName string, opts ...Option) NodeFunc {
 	isolated := dummyNode.agentIsolatedMessages
 	scope := dummyNode.agentEventScope
 	inputFromLast := dummyNode.agentInputFromLastResponse
-	return func(ctx context.Context, state State) (any, error) {
-		ctx, span := trace.Tracer.Start(ctx, "agent_node_execution")
-		defer span.End()
+	return func(ctx context.Context, state State) (a any, err error) {
+		ctx, span := trace.Tracer.Start(ctx, fmt.Sprintf("%s %s", itelemetry.OperationInvokeAgent, agentName))
+		defer func() {
+			if err != nil {
+				span.SetStatus(codes.Error, err.Error())
+				span.SetAttributes(attribute.String(itelemetry.KeyErrorType, itelemetry.ValueDefaultErrorType))
+			}
+			span.End()
+		}()
 
 		// Extract execution context for event emission.
 		invocationID, _, _, _, eventChan := extractExecutionContext(state)
@@ -1282,6 +1457,14 @@ func NewAgentNodeFunc(agentName string, opts ...Option) NodeFunc {
 		// Build invocation for the target agent with custom runtime state and scope.
 		invocation := buildAgentInvocationWithStateAndScope(ctx, parentForInput, childState, targetAgent, scope)
 
+		itelemetry.TraceBeforeInvokeAgent(span, invocation, targetAgent.Info().Description, "", dummyNode.llmGenerationConfig)
+		var stream bool
+		if dummyNode.llmGenerationConfig != nil {
+			stream = dummyNode.llmGenerationConfig.Stream
+		}
+		tracker := itelemetry.NewInvokeAgentTracker(ctx, invocation, stream, &err)
+		defer tracker.RecordMetrics()()
+
 		// Emit agent execution start event.
 		startTime := time.Now()
 		emitAgentStartEvent(ctx, eventChan, invocationID, nodeID, startTime)
@@ -1295,17 +1478,21 @@ func NewAgentNodeFunc(agentName string, opts ...Option) NodeFunc {
 			// Emit agent execution error event.
 			endTime := time.Now()
 			emitAgentErrorEvent(ctx, eventChan, invocationID, nodeID, startTime, endTime, err)
-			span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			tracker.SetResponseErrorType(itelemetry.ValueDefaultErrorType)
 			return nil, fmt.Errorf("failed to run agent %s: %w", agentName, err)
 		}
 
 		// Process agent event stream and capture completion state.
-		lastResponse, finalState, rawDelta, err := processAgentEventStream(
-			ctx, agentEventChan, nodeCallbacks, nodeID, state, eventChan, agentName,
+		lastResponse, finalState, rawDelta, fullRespEvent, tokenUsage, err := processAgentEventStream(
+			ctx, agentEventChan, nodeCallbacks, nodeID, state, eventChan, agentName, tracker,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to process agent event stream: %w", err)
 		}
+
+		itelemetry.TraceAfterInvokeAgent(span, fullRespEvent, tokenUsage, tracker.FirstTokenTimeDuration())
 		// Emit agent execution complete event.
 		endTime := time.Now()
 		emitAgentCompleteEvent(ctx, eventChan, invocationID, nodeID, startTime, endTime)
@@ -1335,10 +1522,13 @@ func processAgentEventStream(
 	state State,
 	eventChan chan<- *event.Event,
 	agentName string,
-) (string, State, map[string][]byte, error) {
+	tracker *itelemetry.InvokeAgentTracker,
+) (string, State, map[string][]byte, *event.Event, *itelemetry.TokenUsage, error) {
 	var lastResponse string
 	var finalState State
 	var rawDelta map[string][]byte
+	var fullRespEvent *event.Event
+	tokenUsage := &itelemetry.TokenUsage{}
 
 	for agentEvent := range agentEventChan {
 		// Run node callbacks for this event.
@@ -1353,13 +1543,25 @@ func processAgentEventStream(
 
 		// Forward the event to the parent event channel.
 		if err := event.EmitEvent(ctx, eventChan, agentEvent); err != nil {
-			return "", nil, nil, err
+			return "", nil, nil, fullRespEvent, tokenUsage, err
 		}
 
 		// Track the last response for state update.
 		if agentEvent.Response != nil && len(agentEvent.Response.Choices) > 0 &&
 			agentEvent.Response.Choices[0].Message.Content != "" {
 			lastResponse = agentEvent.Response.Choices[0].Message.Content
+		}
+
+		if agentEvent.Response != nil {
+			tracker.TrackResponse(agentEvent.Response)
+			if !agentEvent.Response.IsPartial {
+				if agentEvent.Response.Usage != nil {
+					tokenUsage.PromptTokens += agentEvent.Response.Usage.PromptTokens
+					tokenUsage.CompletionTokens += agentEvent.Response.Usage.CompletionTokens
+					tokenUsage.TotalTokens += agentEvent.Response.Usage.TotalTokens
+				}
+				fullRespEvent = agentEvent
+			}
 		}
 
 		// Capture subgraph completion state from its final graph.execution event.
@@ -1388,11 +1590,21 @@ func processAgentEventStream(
 		}
 	}
 
-	return lastResponse, finalState, rawDelta, nil
+	return lastResponse, finalState, rawDelta, fullRespEvent, tokenUsage, nil
 }
 
 // buildAgentInvocationWithStateAndScope builds an invocation for the target agent
 // using a custom runtime state and an optional event filter scope segment.
+//
+// FilterKey Strategy:
+// The FilterKey is built using a stable, deterministic pattern based on the agent
+// hierarchy rather than random UUIDs. This ensures that:
+//  1. Multi-turn conversations work correctly with BranchFilterModePrefix
+//  2. Child agent responses from previous requests are visible in subsequent requests
+//  3. The prefix matching in event.Filter() works as expected across requests
+//
+// Format: parentKey/agentName (without UUID)
+// Example: "input/knowledge" instead of "input/knowledge/random-uuid"
 func buildAgentInvocationWithStateAndScope(
 	ctx context.Context,
 	parentState State,
@@ -1418,25 +1630,24 @@ func buildAgentInvocationWithStateAndScope(
 	// Clone from parent invocation if available to preserve linkage and filtering.
 	if parentInvocation, ok := agent.InvocationFromContext(ctx); ok &&
 		parentInvocation != nil {
+		runOptions := parentInvocation.RunOptions
+		runOptions.RuntimeState = runtime
+
 		base := util.If(scope != "", scope, targetAgent.Info().Name)
 		parentKey := parentInvocation.GetEventFilterKey()
+		// Build a stable FilterKey without UUID to ensure multi-turn conversations
 		var filterKey string
 		if parentKey == "" {
-			filterKey = base + agent.EventFilterKeyDelimiter +
-				uuid.NewString()
+			filterKey = base
 		} else {
-			filterKey = parentKey + agent.EventFilterKeyDelimiter +
-				base + agent.EventFilterKeyDelimiter +
-				uuid.NewString()
+			filterKey = parentKey + agent.EventFilterKeyDelimiter + base
 		}
 		inv := parentInvocation.Clone(
 			agent.WithInvocationAgent(targetAgent),
 			agent.WithInvocationMessage(
 				model.NewUserMessage(userInput),
 			),
-			agent.WithInvocationRunOptions(agent.RunOptions{
-				RuntimeState: runtime,
-			}),
+			agent.WithInvocationRunOptions(runOptions),
 			agent.WithInvocationEventFilterKey(filterKey),
 		)
 		return inv
@@ -1447,10 +1658,168 @@ func buildAgentInvocationWithStateAndScope(
 		agent.WithInvocationRunOptions(agent.RunOptions{RuntimeState: runtime}),
 		agent.WithInvocationMessage(model.NewUserMessage(userInput)),
 		agent.WithInvocationSession(sessionData),
-		// Unify format with clone branch: <agentName>/<uuid>
-		agent.WithInvocationEventFilterKey(targetAgent.Info().Name+agent.EventFilterKeyDelimiter+uuid.NewString()),
+		// Use stable FilterKey based on agent name only (no UUID).
+		agent.WithInvocationEventFilterKey(targetAgent.Info().Name),
 	)
 	return inv
+}
+
+const (
+	errCallbackBeforeTool = "callback before tool error: %w"
+	errCallbackAfterTool  = "callback after tool error: %w"
+)
+
+func runBeforeToolPluginCallbacks(
+	ctx context.Context,
+	toolCall model.ToolCall,
+	decl *tool.Declaration,
+) (context.Context, model.ToolCall, any, error) {
+	invocation, ok := agent.InvocationFromContext(ctx)
+	if !ok || invocation == nil || invocation.Plugins == nil {
+		return ctx, toolCall, nil, nil
+	}
+
+	callbacks := invocation.Plugins.ToolCallbacks()
+	if callbacks == nil {
+		return ctx, toolCall, nil, nil
+	}
+
+	args := &tool.BeforeToolArgs{
+		ToolName:    toolCall.Function.Name,
+		Declaration: decl,
+		Arguments:   toolCall.Function.Arguments,
+	}
+	result, err := callbacks.RunBeforeTool(ctx, args)
+	if err != nil {
+		return ctx, toolCall, nil,
+			fmt.Errorf(errCallbackBeforeTool, err)
+	}
+
+	if result != nil && result.Context != nil {
+		ctx = result.Context
+	}
+	if result != nil && result.CustomResult != nil {
+		return ctx, toolCall, result.CustomResult, nil
+	}
+	if result != nil && result.ModifiedArguments != nil {
+		toolCall.Function.Arguments = result.ModifiedArguments
+	}
+	return ctx, toolCall, nil, nil
+}
+
+func runBeforeToolCallbacks(
+	ctx context.Context,
+	toolCall model.ToolCall,
+	decl *tool.Declaration,
+	toolCallbacks *tool.Callbacks,
+) (context.Context, model.ToolCall, any, error) {
+	if toolCallbacks == nil {
+		return ctx, toolCall, nil, nil
+	}
+
+	args := &tool.BeforeToolArgs{
+		ToolName:    toolCall.Function.Name,
+		Declaration: decl,
+		Arguments:   toolCall.Function.Arguments,
+	}
+	result, err := toolCallbacks.RunBeforeTool(ctx, args)
+	if err != nil {
+		return ctx, toolCall, nil,
+			fmt.Errorf(errCallbackBeforeTool, err)
+	}
+
+	if result != nil && result.Context != nil {
+		ctx = result.Context
+	}
+	if result != nil && result.CustomResult != nil {
+		return ctx, toolCall, result.CustomResult, nil
+	}
+	if result != nil && result.ModifiedArguments != nil {
+		toolCall.Function.Arguments = result.ModifiedArguments
+	}
+	return ctx, toolCall, nil, nil
+}
+
+func ensureCallableTool(
+	t tool.Tool,
+	toolName string,
+) (tool.CallableTool, error) {
+	callableTool, ok := t.(tool.CallableTool)
+	if !ok {
+		return nil, fmt.Errorf("tool %s is not callable", toolName)
+	}
+	return callableTool, nil
+}
+
+func runAfterToolPluginCallbacks(
+	ctx context.Context,
+	toolCall model.ToolCall,
+	decl *tool.Declaration,
+	result any,
+	runErr error,
+) (context.Context, any, error) {
+	invocation, ok := agent.InvocationFromContext(ctx)
+	if !ok || invocation == nil || invocation.Plugins == nil {
+		return ctx, nil, nil
+	}
+
+	callbacks := invocation.Plugins.ToolCallbacks()
+	if callbacks == nil {
+		return ctx, nil, nil
+	}
+
+	args := &tool.AfterToolArgs{
+		ToolName:    toolCall.Function.Name,
+		Declaration: decl,
+		Arguments:   toolCall.Function.Arguments,
+		Result:      result,
+		Error:       runErr,
+	}
+	afterResult, err := callbacks.RunAfterTool(ctx, args)
+	if err != nil {
+		return ctx, nil, fmt.Errorf(errCallbackAfterTool, err)
+	}
+
+	if afterResult != nil && afterResult.Context != nil {
+		ctx = afterResult.Context
+	}
+	if afterResult != nil && afterResult.CustomResult != nil {
+		return ctx, afterResult.CustomResult, nil
+	}
+	return ctx, nil, nil
+}
+
+func runAfterToolCallbacks(
+	ctx context.Context,
+	toolCall model.ToolCall,
+	decl *tool.Declaration,
+	result any,
+	runErr error,
+	toolCallbacks *tool.Callbacks,
+) (context.Context, any, error) {
+	if toolCallbacks == nil {
+		return ctx, nil, nil
+	}
+
+	args := &tool.AfterToolArgs{
+		ToolName:    toolCall.Function.Name,
+		Declaration: decl,
+		Arguments:   toolCall.Function.Arguments,
+		Result:      result,
+		Error:       runErr,
+	}
+	afterResult, err := toolCallbacks.RunAfterTool(ctx, args)
+	if err != nil {
+		return ctx, nil, fmt.Errorf(errCallbackAfterTool, err)
+	}
+
+	if afterResult != nil && afterResult.Context != nil {
+		ctx = afterResult.Context
+	}
+	if afterResult != nil && afterResult.CustomResult != nil {
+		return ctx, afterResult.CustomResult, nil
+	}
+	return ctx, nil, nil
 }
 
 // runTool executes a tool with before/after callbacks and returns the result.
@@ -1471,57 +1840,79 @@ func runTool(
 	toolCallbacks *tool.Callbacks,
 	t tool.Tool,
 ) (context.Context, any, []byte, error) {
-	if toolCallbacks != nil {
-		args := &tool.BeforeToolArgs{
-			ToolName:    toolCall.Function.Name,
-			Declaration: t.Declaration(),
-			Arguments:   toolCall.Function.Arguments,
-		}
-		result, err := toolCallbacks.RunBeforeTool(ctx, args)
-		if err != nil {
-			return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("callback before tool error: %w", err)
-		}
-		// Use the context from result if provided.
-		if result != nil && result.Context != nil {
-			ctx = result.Context
-		}
-		if result != nil && result.CustomResult != nil {
-			return ctx, result.CustomResult, toolCall.Function.Arguments, nil
-		}
-		if result != nil && result.ModifiedArguments != nil {
-			toolCall.Function.Arguments = result.ModifiedArguments
-		}
+	ctx = context.WithValue(ctx, tool.ContextKeyToolCallID{}, toolCall.ID)
+
+	decl := t.Declaration()
+
+	ctx, toolCall, customResult, err := runBeforeToolPluginCallbacks(
+		ctx,
+		toolCall,
+		decl,
+	)
+	if err != nil {
+		return ctx, nil, toolCall.Function.Arguments, err
 	}
-	if callableTool, ok := t.(tool.CallableTool); ok {
-		result, err := callableTool.Call(ctx, toolCall.Function.Arguments)
-		// Run after tool callbacks if they exist.
-		// If the tool returns an error, the callback function will still execute to allow the user to handle the error.
-		if toolCallbacks != nil {
-			args := &tool.AfterToolArgs{
-				ToolName:    toolCall.Function.Name,
-				Declaration: t.Declaration(),
-				Arguments:   toolCall.Function.Arguments,
-				Result:      result,
-				Error:       err,
-			}
-			afterResult, afterErr := toolCallbacks.RunAfterTool(ctx, args)
-			if afterErr != nil {
-				return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("callback after tool error: %w", afterErr)
-			}
-			// Use the context from result if provided for subsequent operations.
-			if afterResult != nil && afterResult.Context != nil {
-				ctx = afterResult.Context
-			}
-			if afterResult != nil && afterResult.CustomResult != nil {
-				return ctx, afterResult.CustomResult, toolCall.Function.Arguments, nil
-			}
-		}
-		if err != nil {
-			return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("tool %s call failed: %w", toolCall.Function.Name, err)
-		}
-		return ctx, result, toolCall.Function.Arguments, nil
+	if customResult != nil {
+		return ctx, customResult, toolCall.Function.Arguments, nil
 	}
-	return ctx, nil, toolCall.Function.Arguments, fmt.Errorf("tool %s is not callable", toolCall.Function.Name)
+
+	ctx, toolCall, customResult, err = runBeforeToolCallbacks(
+		ctx,
+		toolCall,
+		decl,
+		toolCallbacks,
+	)
+	if err != nil {
+		return ctx, nil, toolCall.Function.Arguments, err
+	}
+	if customResult != nil {
+		return ctx, customResult, toolCall.Function.Arguments, nil
+	}
+
+	callableTool, err := ensureCallableTool(t, toolCall.Function.Name)
+	if err != nil {
+		return ctx, nil, toolCall.Function.Arguments, err
+	}
+
+	result, toolErr := callableTool.Call(ctx, toolCall.Function.Arguments)
+
+	ctx, customResult, err = runAfterToolPluginCallbacks(
+		ctx,
+		toolCall,
+		decl,
+		result,
+		toolErr,
+	)
+	if err != nil {
+		return ctx, nil, toolCall.Function.Arguments, err
+	}
+	if customResult != nil {
+		return ctx, customResult, toolCall.Function.Arguments, nil
+	}
+
+	ctx, customResult, err = runAfterToolCallbacks(
+		ctx,
+		toolCall,
+		decl,
+		result,
+		toolErr,
+		toolCallbacks,
+	)
+	if err != nil {
+		return ctx, nil, toolCall.Function.Arguments, err
+	}
+	if customResult != nil {
+		return ctx, customResult, toolCall.Function.Arguments, nil
+	}
+
+	if toolErr != nil {
+		return ctx, nil, toolCall.Function.Arguments, fmt.Errorf(
+			"tool %s call failed: %w",
+			toolCall.Function.Name,
+			toolErr,
+		)
+	}
+	return ctx, result, toolCall.Function.Arguments, nil
 }
 
 // extractModelInput extracts the model input from state and instruction.
@@ -1625,7 +2016,8 @@ const (
 func executeModelWithEvents(ctx context.Context, config modelExecutionConfig) (any, error) {
 	ctx, responseChan, err := runModel(ctx, config.ModelCallbacks, config.LLMModel, config.Request)
 	if err != nil {
-		config.Span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
+		config.Span.RecordError(err)
+		config.Span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("failed to run model: %w", err)
 	}
 	invocation, ok := agent.InvocationFromContext(ctx)
@@ -1936,14 +2328,16 @@ func executeSingleToolCall(ctx context.Context, config singleToolCallConfig) (mo
 		if interruptErr != nil {
 			return model.Message{}, interruptErr
 		}
-		config.Span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
+		config.Span.RecordError(err)
+		config.Span.SetStatus(codes.Error, err.Error())
 		return model.Message{}, fmt.Errorf("tool %s call failed: %w", name, err)
 	}
 
 	// Marshal result to JSON.
 	content, err := json.Marshal(result)
 	if err != nil {
-		config.Span.SetAttributes(attribute.String("trpc.go.agent.error", err.Error()))
+		config.Span.RecordError(err)
+		config.Span.SetStatus(codes.Error, err.Error())
 		return model.Message{}, fmt.Errorf("failed to marshal tool result: %w", err)
 	}
 

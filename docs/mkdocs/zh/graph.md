@@ -599,6 +599,8 @@ stateGraph.AddLLMNode("analyze", model,
 - GraphAgent/Runner 仅设置 `user_input`，不再预先把用户消息写入
   `messages`。这样可以允许在 LLM 节点之前的任意节点对 `user_input`
   进行修改，并能在同一轮生效。
+- Graph 在执行子 Agent 时会保留父调用的 `RequestID`（请求标识），
+  确保当会话历史里已包含本轮用户输入时，不会在提示词中重复插入。
 
 #### 三种输入范式
 
@@ -625,7 +627,7 @@ stateGraph.AddLLMNode("analyze", model,
 
 LLM 节点的 `instruction` 支持占位符注入（与 LLMAgent 规则一致）。支持原生 `{key}` 与 Mustache `{{key}}` 两种写法（Mustache 会自动规整为原生写法）：
 
-- `{key}` / `{{key}}` → 替换为 `session.State["key"]`
+- `{key}` / `{{key}}` → 替换为会话状态中键 `key` 对应的字符串值（可通过 `sess.SetState("key", ...)` 或 SessionService 写入）
 - `{key?}` / `{{key?}}` → 可选，缺失时替换为空
 - `{user:subkey}`、`{app:subkey}`、`{temp:subkey}`（以及其 Mustache 写法）→ 访问用户/应用/临时命名空间（SessionService 会将 app/user 作用域合并到 session，并带上前缀）
 
@@ -661,9 +663,8 @@ stateGraph.AddNode("retrieve", func(ctx context.Context, s graph.State) (any, er
     var input string
     if v, ok := s[graph.StateKeyUserInput].(string); ok { input = v }
     if sess, _ := s[graph.StateKeySession].(*session.Session); sess != nil {
-        if sess.State == nil { sess.State = make(session.StateMap) }
-        sess.State[session.StateTempPrefix+"retrieved_context"] = []byte(retrieved)
-        sess.State[session.StateTempPrefix+"user_input"] = []byte(input)
+        sess.SetState(session.StateTempPrefix+"retrieved_context", []byte(retrieved))
+        sess.SetState(session.StateTempPrefix+"user_input", []byte(input))
     }
     return graph.State{}, nil
 })
@@ -678,8 +679,8 @@ stateGraph.AddLLMNode("answer", mdl,
 
 占位符与会话状态的最佳实践
 
-- 短期 vs 持久：只用于本轮提示词组装的数据写到 `session.State` 的 `temp:*`；需要跨轮/跨会话保留的配置，请通过 SessionService（会话服务）更新 `user:*`/`app:*`。
-- 为什么可以直接写：LLM 节点从图状态里的会话对象读取并展开占位符，见 [graph/state_graph.go](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/state_graph.go)；GraphAgent 在启动时把会话对象放入图状态，见 [agent/graphagent/graph_agent.go](https://github.com/trpc-group/trpc-agent-go/blob/main/agent/graphagent/graph_agent.go)。
+- 短期 vs 持久：只用于本轮提示词组装的数据写到 `temp:*`（建议通过 `sess.SetState` 写入）；需要跨轮/跨会话保留的配置，请通过 SessionService（会话服务）更新 `user:*`/`app:*`。
+- 为什么推荐用 SetState：LLM 节点从图状态里的会话对象读取并展开占位符，使用 `sess.SetState` 可避免不安全的并发 map 访问。
 - 服务侧护栏：内存实现禁止通过“更新用户态”的接口写 `temp:*`（以及 `app:*` via user updater），见 [session/inmemory/service.go](https://github.com/trpc-group/trpc-agent-go/blob/main/session/inmemory/service.go)。
 - 并发建议：并行分支不要同时改同一批 `session.State` 键；建议汇总到单节点合并后一次写入，或先放图状态再一次写到 `temp:*`。
 - 可观测性：若希望在完成事件中看到摘要，可额外把精简信息放入图状态（如 `metadata`）；最终事件会序列化非内部的最终状态，见 [graph/events.go](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/events.go)。
@@ -743,6 +744,10 @@ func preparePromptNode(ctx context.Context, state graph.State) (any, error) {
 - `WithSubgraphIsolatedMessages(true)` 只对 `AddSubgraphNode` 有效，
   对 `AddLLMNode` 无效；如需在 LLM 节点间隔离消息，请使用
   `RemoveAllMessages`
+- 对 Agent 节点来说，`WithSubgraphIsolatedMessages(true)` 会禁止向子 Agent
+  注入会话历史；这也会让子 Agent 看不到工具返回，因此会破坏“工具多轮
+  调用”。若子 Agent 需要多轮工具调用，请不要开启该选项，而应通过子 Agent
+  的消息过滤能力来实现隔离（见“Agent 节点：隔离与工具多轮”）。
 
 ### 3. GraphAgent 配置选项
 
@@ -777,6 +782,14 @@ graphAgent, err := graphagent.New(
 	//  - graphagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
 	//  - graphagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
 	graphagent.WithMessageBranchFilterMode(graphagent.TimelineFilterAll),
+	// 推理内容模式（DeepSeek 思考模式）
+	// 默认值: graphagent.ReasoningContentModeDiscardPreviousTurns
+	// 可选值:
+	//  - graphagent.ReasoningContentModeDiscardPreviousTurns: 丢弃之前请求轮次的
+	//    reasoning_content（默认，推荐）
+	//  - graphagent.ReasoningContentModeKeepAll: 保留所有 reasoning_content
+	//  - graphagent.ReasoningContentModeDiscardAll: 丢弃所有 reasoning_content
+	graphagent.WithReasoningContentMode(graphagent.ReasoningContentModeDiscardPreviousTurns),
 	graphagent.WithAgentCallbacks(&agent.Callbacks{
 		// Agent 级回调配置
 	}),
@@ -837,6 +850,30 @@ stateGraph.AddAgentNode("assistant",
 
 > Agent 节点会以节点 ID 作为查找键，因此需确保 `AddAgentNode("assistant")`
 > 与 `subAgent.Info().Name == "assistant"` 一致。
+
+#### Agent 节点：隔离与工具多轮
+
+工具调用通常是“多轮”的：模型（Large Language Model，LLM，大语言模型）
+先返回一个工具调用（tool call），框架执行工具并产出结果，然后**下一次**
+模型请求必须带上工具返回（一个 `role=tool` 的消息），模型才能基于工具结果
+继续推理与输出。
+
+`WithSubgraphIsolatedMessages(true)` 是一个**强隔离开关**：它会阻止子 Agent
+在构建下一轮模型请求时读取任何会话历史（内部等价于为子 Agent 设置
+`include_contents="none"`）。这会让子 Agent 变成“黑盒”（只看本轮
+`user_input`），但也意味着子 Agent 看不到工具返回，因此无法完成工具多轮。
+
+如果子 Agent 需要使用工具，并且需要在工具返回后继续下一轮：
+
+- 不要在该 Agent 节点上开启 `WithSubgraphIsolatedMessages(true)`。
+- 应保留会话注入，并通过子 Agent 自身的消息过滤把“可见历史”限制在其
+  invocation（一次调用链）范围内。对于 `LLMAgent`，可使用：
+  `llmagent.WithMessageFilterMode(llmagent.IsolatedInvocation)`。
+
+常见的错误现象：
+
+- 第二次模型请求与第一次几乎一致（prompt 里看不到工具返回）。
+- 子 Agent 会重复第一轮工具调用，或进入循环，因为它永远“看不到”工具结果。
 
 ### 4. 条件路由
 
@@ -2445,7 +2482,8 @@ sg.AddAgentNode("orchestrator",
         }
         return nil, nil
     }),
-    // 可选：隔离子 Agent 的会话注入，仅消费本轮 user_input
+    // 可选：隔离子 Agent 的会话注入，仅消费本轮 user_input。
+    // 仅在子 Agent 单轮即可完成（不需要工具多轮）时使用。
     graph.WithSubgraphIsolatedMessages(true),
 )
 ```
@@ -2456,7 +2494,9 @@ sg.AddAgentNode("orchestrator",
 // 框架提供声明式 Option，自动执行 last_response → user_input 的映射
 sg.AddAgentNode("orchestrator",
     graph.WithSubgraphInputFromLastResponse(),
-    graph.WithSubgraphIsolatedMessages(true), // 可选，配合隔离达到“只传结果”
+    // 可选：配合隔离达到“只传结果”。
+    // 仅在子 Agent 单轮即可完成（不需要工具多轮）时使用。
+    graph.WithSubgraphIsolatedMessages(true),
 )
 ```
 

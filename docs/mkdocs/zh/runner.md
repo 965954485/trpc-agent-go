@@ -2,7 +2,7 @@
 
 ## 概述
 
-Runner 提供了运行 Agent 的接口，负责会话管理和事件流处理。Runner 的核心职责是：获取或创建会话、生成 Invocation ID、调用 Agent.Run 方法、处理返回的事件流并将非 partial 响应事件追加到会话中。
+Runner 提供了运行 Agent 的接口，负责会话管理和事件流处理。Runner 的核心职责是：获取或创建会话、生成 Invocation ID、通过 `agent.RunWithPlugins` 调用 Agent、处理返回的事件流并将非 partial 响应事件追加到会话中。
 
 ### 🎯 核心特性
 
@@ -11,6 +11,7 @@ Runner 提供了运行 Agent 的接口，负责会话管理和事件流处理。
 - **🆔 ID 生成**：自动生成 Invocation ID 和事件 ID
 - **📊 可观测集成**：集成 telemetry/trace，自动记录 span
 - **✅ 完成事件**：在 Agent 事件流结束后生成 runner-completion 事件
+- **🔌 插件**：在 Runner 上注册一次，全局作用于该 Runner 管理的 Agent、Tool 和模型调用。
 
 ## 架构设计
 
@@ -19,7 +20,7 @@ Runner 提供了运行 Agent 的接口，负责会话管理和事件流处理。
 │       Runner        │  - 会话管理
 └─────────┬───────────┘  - 事件流处理
           │
-          │ r.agent.Run(ctx, invocation)
+          │ agent.RunWithPlugins(ctx, invocation, r.agent)
           │
 ┌─────────▼───────────┐
 │       Agent         │  - 接收 Invocation
@@ -152,6 +153,29 @@ r := runner.NewRunner("my-app", agent,
     runner.WithSessionService(sessionService),  // 会话服务
 )
 ```
+
+### 🔌 插件
+
+Runner 插件是一类全局、Runner 作用域的 Hook（钩子）。只需要在创建 Runner 时
+注册一次，后续该 Runner 执行的所有 Agent、Tool 和模型调用都会自动生效。
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/plugin"
+
+r := runner.NewRunner("my-app", a,
+    runner.WithPlugins(
+        plugin.NewLogging(),
+        plugin.NewGlobalInstruction("You must follow security policies."),
+    ),
+)
+defer r.Close()
+```
+
+说明：
+
+- 插件名在同一个 Runner 内必须唯一。
+- 插件按注册顺序执行。
+- 如果插件实现了 `plugin.Closer`，Runner 会在 `Close()` 时调用它。
 
 ### 运行对话
 
@@ -316,6 +340,36 @@ agent := llmagent.New("assistant",
 // 使用 Runner 执行 Agent
 r := runner.NewRunner("my-app", agent)
 ```
+
+### 在请求级别切换 Agent
+
+Runner 支持在构造时注册多个可选 Agent，并在单次 Run 时切换。
+
+```go
+reader := llmagent.New("agent1", llmagent.WithModel(model))
+writer := llmagent.New("agent2", llmagent.WithModel(model))
+
+r := runner.NewRunner("appName", reader, // 使用 reader agent 作为默认 agent
+    runner.WithAgent("writer", writer),  // 按名称注册可选 Agent
+)
+
+// 使用 reader agent 作为默认 agent
+ch, err := r.Run(ctx, userID, sessionID, msg)
+
+// 通过 Agent Name 指定使用 writer agent
+ch, err := r.Run(ctx, userID, sessionID, msg, agent.WithAgentByName("writer"))
+
+// 直接传入实例，无需预注册。
+custom := llmagent.New("custom", llmagent.WithModel(model))
+ch, err := r.Run(ctx, userID, sessionID, msg, agent.WithAgent(custom))
+```
+
+- `runner.NewRunner("appName", agent)`：在创建 runner 时设置默认 Agent；
+- `runner.WithAgent("agentName", agent)`: 在创建 Runner 时预注册一个 Agent，供后续请求按名称切换；
+- `agent.WithAgentByName("agentName")`: 在单次请求里通过名称选用已注册的 Agent；
+- `agent.WithAgent(agent)`: 在单次请求里直接传入一个 Agent 实例临时覆盖，无需预注册。
+
+Agent 生效优先级：`agent.WithAgent` > `agent.WithAgentByName` > `runner.NewRunner` 设置的默认 Agent。
 
 ### 生成配置
 

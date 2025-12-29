@@ -10,34 +10,40 @@ English | [中文](README.zh_CN.md)
 [![Coverage](https://codecov.io/gh/trpc-group/trpc-agent-go/branch/main/graph/badge.svg)](https://app.codecov.io/gh/trpc-group/trpc-agent-go/tree/main)
 [![Documentation](https://img.shields.io/badge/Docs-Website-blue.svg)](https://trpc-group.github.io/trpc-agent-go/)
 
-🚀 **A powerful Go framework for building intelligent agent systems** that transforms how you create AI applications. Build autonomous agents that think, remember, collaborate, and act with unprecedented ease.
+**A powerful Go framework for building intelligent agent systems** that transforms how you create AI applications. Build autonomous agents that think, remember, collaborate, and act with unprecedented ease.
 
-✨ **Why tRPC-Agent-Go?**
+**Why tRPC-Agent-Go?**
 
-- 🧠 **Intelligent Reasoning**: Advanced hierarchical planners and multi-agent orchestration
-- 🧰 **Rich Tool Ecosystem**: Seamless integration with external APIs, databases, and services
-- 💾 **Persistent Memory**: Long-term state management and contextual awareness
-- 🔗 **Multi-Agent Collaboration**: Chain, parallel, and graph-based agent workflows
-- 📊 **Production Ready**: Built-in telemetry, tracing, and enterprise-grade reliability
-- ⚡ **High Performance**: Optimized for scalability and low latency
+- **Intelligent Reasoning**: Advanced hierarchical planners and multi-agent orchestration
+- **Rich Tool Ecosystem**: Seamless integration with external APIs, databases, and services
+- **Persistent Memory**: Long-term state management and contextual awareness
+- **Multi-Agent Collaboration**: Chain, parallel, and graph-based agent workflows
+- **GraphAgent**: Type-safe graph workflows with multi-conditional routing, functionally equivalent to LangGraph for Go
+- **Agent Skills**: Reusable `SKILL.md` workflows with safe execution
+- **Artifacts**: Versioned storage for files produced by agents and tools
+- **Evaluation & Benchmarks**: Eval sets + metrics to measure quality over time
+- **UI & Server Integration**: AG-UI (Agent-User Interaction),
+  and Agent-to-Agent (A2A) interoperability
+- **Production Ready**: Built-in telemetry, tracing, and enterprise-grade reliability
+- **High Performance**: Optimized for scalability and low latency
 
-## 🎯 Use Cases
+## Use Cases
 
 **Perfect for building:**
 
-- 🤖 **Customer Support Bots** - Intelligent agents that understand context and solve complex queries
-- 📊 **Data Analysis Assistants** - Agents that query databases, generate reports, and provide insights
-- 🔧 **DevOps Automation** - Smart deployment, monitoring, and incident response systems
-- 💼 **Business Process Automation** - Multi-step workflows with human-in-the-loop capabilities
-- 🧠 **Research & Knowledge Management** - RAG-powered agents for document analysis and Q&A
+- **Customer Support Bots** - Intelligent agents that understand context and solve complex queries
+- **Data Analysis Assistants** - Agents that query databases, generate reports, and provide insights
+- **DevOps Automation** - Smart deployment, monitoring, and incident response systems
+- **Business Process Automation** - Multi-step workflows with human-in-the-loop capabilities
+- **Research & Knowledge Management** - RAG-powered agents for document analysis and Q&A
 
-## 🚀 Key Features
+## Key Features
 
 <table>
 <tr>
-<td width="50%">
+<td width="50%" valign="top">
 
-### 🎪 **Multi-Agent Orchestration**
+### Multi-Agent Orchestration
 
 ```go
 // Chain agents for complex workflows
@@ -52,9 +58,9 @@ parallel := parallelagent.New("concurrent",
 ```
 
 </td>
-<td width="50%">
+<td width="50%" valign="top">
 
-### 🧠 **Advanced Memory System**
+### Advanced Memory System
 
 ```go
 // Persistent memory with search
@@ -73,9 +79,9 @@ runner := runner.NewRunner("app", agent,
 </td>
 </tr>
 <tr>
-<td>
+<td valign="top">
 
-### 🛠️ **Rich Tool Integration**
+### Rich Tool Integration
 
 ```go
 // Any function becomes a tool
@@ -89,17 +95,53 @@ mcpTool := mcptool.New(serverConn)
 ```
 
 </td>
-<td>
+<td valign="top">
 
-### 📈 **Production Monitoring**
+### Production Observability
 
 ```go
-// OpenTelemetry integration
-runner := runner.NewRunner("app", agent,
-    runner.WithTelemetry(telemetry.Config{
-        TracingEnabled: true,
-        MetricsEnabled: true,
-    }))
+// Start Langfuse integration
+clean, _ := langfuse.Start(ctx)
+defer clean(ctx)
+
+runner := runner.NewRunner("app", agent)
+// Run with Langfuse attributes
+events, _ := runner.Run(ctx, "user-1", "session-1", 
+    model.NewUserMessage("Hello"),
+    agent.WithSpanAttributes(
+        attribute.String("langfuse.user.id", "user-1"),
+        attribute.String("langfuse.session.id", "session-1"),
+    ))
+```
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### Agent Skills
+
+```go
+// Skills are folders with a SKILL.md spec.
+repo, _ := skill.NewFSRepository("./skills")
+
+// Let the agent load and run skills on demand.
+tools := []tool.Tool{
+    skilltool.NewLoadTool(repo),
+    skilltool.NewRunTool(repo, localexec.New()),
+}
+```
+
+</td>
+<td valign="top">
+
+### Evaluation & Benchmarks
+
+```go
+evaluator, _ := evaluation.New("app", runner,
+    evaluation.WithNumRuns(3))
+result, _ := evaluator.Evaluate(ctx, "math-basic")
+_ = result.OverallStatus
 ```
 
 </td>
@@ -108,64 +150,87 @@ runner := runner.NewRunner("app", agent,
 
 ## Table of Contents
 
-- [Use Cases](#-use-cases)
-- [Key Features](#-key-features)
-- [Documentation](#documentation)
-- [Quick Start](#quick-start)
-- [Examples](#examples)
-  - [Tool Usage](#1-tool-usage-examples)
-  - [LLM-only Agent](#2-llm-only-agent)
-  - [Multi-Agent Runners](#3-multi-agent-runners)
-  - [Graph Agent](#4-graph-agent)
-  - [Memory](#5-memory)
-  - [Knowledge](#6-knowledge)
-  - [Telemetry & Tracing](#7-telemetry--tracing)
-  - [MCP Integration](#8-mcp-integration)
-  - [Debug Web Demo](#9-debug-web-demo)
-- [Architecture Overview](#architecture-overview)
-- [Using Built-in Agents](#using-built-in-agents)
-- [Future Enhancements](#future-enhancements)
-- [Contributing](#contributing)
-- [Acknowledgements](#acknowledgements)
+- [tRPC-Agent-Go](#trpc-agent-go)
+  - [Use Cases](#use-cases)
+  - [Key Features](#key-features)
+    - [**Multi-Agent Orchestration**](#multi-agent-orchestration)
+    - [**Advanced Memory System**](#advanced-memory-system)
+    - [**Rich Tool Integration**](#rich-tool-integration)
+    - [**Production Observability**](#production-observability)
+    - [**Agent Skills**](#agent-skills)
+    - [**Evaluation \& Benchmarks**](#evaluation--benchmarks)
+  - [Table of Contents](#table-of-contents)
+  - [Documentation](#documentation)
+  - [Quick Start](#quick-start)
+    - [Prerequisites](#prerequisites)
+    - [Run the Example](#run-the-example)
+    - [Basic Usage](#basic-usage)
+  - [Examples](#examples)
+    - [1. Tool Usage](#1-tool-usage)
+    - [2. LLM-Only Agent](#2-llm-only-agent)
+    - [3. Multi-Agent Runners](#3-multi-agent-runners)
+    - [4. Graph Agent](#4-graph-agent)
+    - [5. Memory](#5-memory)
+    - [6. Knowledge](#6-knowledge)
+    - [7. Telemetry \& Tracing](#7-telemetry--tracing)
+    - [8. MCP Integration](#8-mcp-integration)
+    - [9. AG-UI Demo](#9-ag-ui-demo)
+    - [10. Evaluation](#10-evaluation)
+    - [11. Agent Skills](#11-agent-skills)
+    - [12. Artifacts](#12-artifacts)
+    - [13. A2A Interop](#13-a2a-interop)
+  - [Architecture Overview](#architecture-overview)
+    - [**Execution Flow**](#execution-flow)
+  - [Using Built-in Agents](#using-built-in-agents)
+    - [Multi-Agent Collaboration Example](#multi-agent-collaboration-example)
+  - [Contributing](#contributing)
+    - [**Ways to Contribute**](#ways-to-contribute)
+    - [**Quick Contribution Setup**](#quick-contribution-setup)
+  - [Acknowledgements](#acknowledgements)
+    - [**Enterprise Validation**](#enterprise-validation)
+    - [**Open Source Inspiration**](#open-source-inspiration)
+  - [Star History](#star-history)
+  - [License](#license)
+    - [**Star us on GitHub** • **Report Issues** • **Join Discussions**](#star-us-on-github--report-issues--join-discussions)
 
 ## Documentation
 
 Ready to dive into tRPC-Agent-Go? Our [documentation](https://trpc-group.github.io/trpc-agent-go/) covers everything from basic concepts to advanced techniques, helping you build powerful AI applications with confidence. Whether you're new to AI agents or an experienced developer, you'll find detailed guides, practical examples, and best practices to accelerate your development journey.
 
-## ⚡ Quick Start
+## Quick Start
 
-> 🎬 **See it in Action**: _[Demo GIF placeholder - showing agent reasoning and tool usage]_
+> **See it in Action**: _[Demo GIF placeholder - showing agent reasoning and tool usage]_
 
-### 📋 Prerequisites
+### Prerequisites
 
-- ✅ Go 1.21 or later
-- 🔑 LLM provider API key (OpenAI, DeepSeek, etc.)
-- 💡 5 minutes to build your first intelligent agent
+- Go 1.21 or later
+- LLM provider API key (OpenAI, DeepSeek, etc.)
+- 5 minutes to build your first intelligent agent
 
-### 🚀 Run the Example
+### Run the Example
 
 **Get started in 3 simple steps:**
 
 ```bash
-# 1️⃣ Clone and setup
+# 1. Clone and setup
 git clone https://github.com/trpc-group/trpc-agent-go.git
 cd trpc-agent-go
 
-# 2️⃣ Configure your LLM
+# 2. Configure your LLM
 export OPENAI_API_KEY="your-api-key-here"
 export OPENAI_BASE_URL="your-base-url-here"  # Optional
 
-# 3️⃣ Run your first agent! 🎉
+# 3. Run your first agent!
 cd examples/runner
 go run . -model="gpt-4o-mini" -streaming=true
 ```
 
 **What you'll see:**
 
-- 💬 **Interactive chat** with your AI agent
-- ⚡ **Real-time streaming** responses
-- 🧮 **Tool usage** (calculator + time tools)
-- 🔄 **Multi-turn conversations** with memory
+- **Interactive chat** with your AI agent
+- **Real-time streaming** responses
+- **Tool usage** (calculator + time tools)
+- **Multi-turn conversations** with memory
 
 Try asking: "What's the current time? Then calculate 15 \* 23 + 100"
 
@@ -277,19 +342,25 @@ The `examples` directory contains runnable demos covering every major feature.
 - [examples/agenttool](examples/agenttool) shows streaming and non-streaming
   patterns.
 
-### 2. LLM-Only Agent ([examples/llmagent](examples/llmagent))
+### 2. LLM-Only Agent
+
+Example: [examples/llmagent](examples/llmagent)
 
 - Wrap any chat-completion model as an `LLMAgent`.
 - Configure system instructions, temperature, max tokens, etc.
 - Receive incremental `event.Event` updates while the model streams.
 
-### 3. Multi-Agent Runners ([examples/multiagent](examples/multiagent))
+### 3. Multi-Agent Runners
+
+Example: [examples/multiagent](examples/multiagent)
 
 - **ChainAgent** – linear pipeline of sub-agents.
 - **ParallelAgent** – run sub-agents concurrently and merge results.
 - **CycleAgent** – iterate until a termination condition is met.
 
-### 4. Graph Agent ([examples/graph](examples/graph))
+### 4. Graph Agent
+
+Example: [examples/graph](examples/graph)
 
 - **GraphAgent** – demonstrates building and executing complex, conditional
   workflows using the `graph` and `agent/graph` packages. It shows
@@ -321,22 +392,30 @@ sg.AddMultiConditionalEdges(
 sg.SetFinishPoint("A").SetFinishPoint("B")
 ```
 
-### 5. Memory ([examples/memory](examples/memory))
+### 5. Memory
+
+Example: [examples/memory](examples/memory)
 
 - In‑memory and Redis memory services with CRUD, search and tool integration.
 - How to configure, call tools and customize prompts.
 
-### 6. Knowledge ([examples/knowledge](examples/knowledge))
+### 6. Knowledge
+
+Example: [examples/knowledge](examples/knowledge)
 
 - Basic RAG example: load sources, embed to a vector store, and search.
 - How to use conversation context and tune loading/concurrency options.
 
-### 7. Telemetry & Tracing ([examples/telemetry](examples/telemetry))
+### 7. Telemetry & Tracing
+
+Example: [examples/telemetry](examples/telemetry)
 
 - OpenTelemetry hooks across model, tool and runner layers.
 - Export traces to OTLP endpoint for real-time analysis.
 
-### 8. MCP Integration ([examples/mcptool](examples/mcptool))
+### 8. MCP Integration
+
+Example: [examples/mcptool](examples/mcptool)
 
 - Wrapper utilities around **trpc-mcp-go**, an implementation of the
   **Model Context Protocol (MCP)**.
@@ -345,12 +424,42 @@ sg.SetFinishPoint("A").SetFinishPoint("B")
 - Enables dynamic tool execution and context-rich interactions between agents
   and LLMs.
 
-### 9. Debug Web Demo ([examples/debugserver](examples/debugserver))
+### 9. AG-UI Demo
 
-- Launches a **debug Server** that speaks ADK-compatible HTTP endpoints.
-- Front-end: [google/adk-web](https://github.com/google/adk-web) connects via
-  `/run_sse`, streams agent responses in real-time.
-- Great starting point for building your own chat UI.
+Example: [examples/agui](examples/agui)
+
+- Exposes a Runner through the AG-UI (Agent-User Interaction) protocol.
+- Built-in Server-Sent Events (SSE) server, plus client samples (for example,
+  CopilotKit).
+
+### 10. Evaluation
+
+Example: [examples/evaluation](examples/evaluation)
+
+- Evaluate an agent with repeatable eval sets and pluggable metrics.
+- Includes local file-backed runs and in-memory runs.
+
+### 11. Agent Skills
+
+Example: [examples/skillrun](examples/skillrun)
+
+- Skills are folders with a `SKILL.md` spec + optional docs/scripts.
+- Built-in tools: `skill_load`, `skill_list_docs`, `skill_select_docs`,
+  `skill_run` (runs commands in an isolated workspace).
+
+### 12. Artifacts
+
+Example: [examples/artifact](examples/artifact)
+
+- Save and retrieve versioned files (images, text, reports) produced by tools.
+- Supports multiple backends (in-memory, S3, COS).
+
+### 13. A2A Interop
+
+Example: [examples/a2aadk](examples/a2aadk)
+
+- Agent-to-Agent (A2A) interop with an ADK Python A2A server.
+- Demonstrates streaming, tool calls, and code execution across runtimes.
 
 Other notable examples:
 
@@ -359,20 +468,20 @@ Other notable examples:
 
 See individual `README.md` files in each example folder for usage details.
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 Architecture
 
-![architecture](docs/mkdocs/assets/img/component_architecture.png)
+![architecture](docs/mkdocs/assets/img/component_architecture.svg)
 
-### 🔄 **Execution Flow**
+### **Execution Flow**
 
-1. **🚀 Runner** orchestrates the entire execution pipeline with session management
-2. **🤖 Agent** processes requests using multiple specialized components
-3. **🧠 Planner** determines the optimal strategy and tool selection
-4. **🛠️ Tools** execute specific tasks (API calls, calculations, web searches)
-5. **💾 Memory** maintains context and learns from interactions
-6. **📚 Knowledge** provides RAG capabilities for document understanding
+1. **Runner** orchestrates the entire execution pipeline with session management
+2. **Agent** processes requests using multiple specialized components
+3. **Planner** determines the optimal strategy and tool selection
+4. **Tools** execute specific tasks (API calls, calculations, web searches)
+5. **Memory** maintains context and learns from interactions
+6. **Knowledge** provides RAG capabilities for document understanding
 
 Key packages:
 
@@ -386,9 +495,13 @@ Key packages:
 | `memory`    | Records user long-term memory and personalized information.                                                 |
 | `knowledge` | Implements RAG knowledge retrieval capabilities.                                                            |
 | `planner`   | Provides Agent planning and reasoning capabilities.                                                         |
+| `artifact`  | Stores and retrieves versioned files produced by agents and tools (images, reports, etc.).                  |
+| `skill`     | Loads and executes reusable Agent Skills defined by `SKILL.md`.                                             |
+| `event`     | Defines event types and streaming payloads used across Runner and servers.                                  |
+| `evaluation` | Evaluates agents on eval sets using pluggable metrics and stores results.                                  |
+| `server`    | Exposes HTTP servers (AG-UI, A2A) for integration and UIs.                                                  |
+| `telemetry` | OpenTelemetry tracing and metrics instrumentation.                                                          |
 
-Execution flow
-![execution](docs/mkdocs/assets/img/timing_diagram.png)
 
 ## Using Built-in Agents
 
@@ -435,18 +548,18 @@ for ev := range events { /* ... */ }
 The composition API lets you nest chains, cycles, or parallels to build complex
 workflows without low-level plumbing.
 
-## 🤝 Contributing
+## Contributing
 
-We ❤️ contributions! Join our growing community of developers building the future of AI agents.
+We love contributions! Join our growing community of developers building the future of AI agents.
 
-### 🌟 **Ways to Contribute**
+### **Ways to Contribute**
 
-- 🐛 **Report bugs** or suggest features via [Issues](https://github.com/trpc-group/trpc-agent-go/issues)
-- 📖 **Improve documentation** - help others learn faster
-- 🔧 **Submit PRs** - bug fixes, new features, or examples
-- 💡 **Share your use cases** - inspire others with your agent applications
+- **Report bugs** or suggest features via [Issues](https://github.com/trpc-group/trpc-agent-go/issues)
+- **Improve documentation** - help others learn faster
+- **Submit PRs** - bug fixes, new features, or examples
+- **Share your use cases** - inspire others with your agent applications
 
-### 🚀 **Quick Contribution Setup**
+### **Quick Contribution Setup**
 
 ```bash
 # Fork & clone the repo
@@ -457,30 +570,30 @@ cd trpc-agent-go
 go test ./...
 go vet ./...
 
-# Make your changes and submit a PR! 🎉
+# Make your changes and submit a PR!
 ```
 
-📋 **Please read** [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines and coding standards.
+**Please read** [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines and coding standards.
 
-## 🏆 Acknowledgements
+## Acknowledgements
 
-### 🏢 **Enterprise Validation**
+### **Enterprise Validation**
 
-Special thanks to Tencent's business units including **Tencent Yuanbao**, **Tencent Video**, **Tencent News**, **IMA**, and **QQ Music** for their invaluable support and real-world validation. Production usage drives framework excellence! 🚀
+Special thanks to Tencent's business units including **Tencent Yuanbao**, **Tencent Video**, **Tencent News**, **IMA**, and **QQ Music** for their invaluable support and real-world validation. Production usage drives framework excellence!
 
-### 🌟 **Open Source Inspiration**
+### **Open Source Inspiration**
 
-Inspired by amazing frameworks like **ADK**, **Agno**, **CrewAI**, **AutoGen**, and many others. Standing on the shoulders of giants! 🙏
+Inspired by amazing frameworks like **ADK**, **Agno**, **CrewAI**, **AutoGen**, and many others. Standing on the shoulders of giants!
 
 ---
 
-## ⭐ Star History
+## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=trpc-group/trpc-agent-go&type=Date)](https://star-history.com/#trpc-group/trpc-agent-go&Date)
 
 ---
 
-## 📜 License
+## License
 
 Licensed under the **Apache 2.0 License** - see [LICENSE](LICENSE) file for details.
 
@@ -488,9 +601,9 @@ Licensed under the **Apache 2.0 License** - see [LICENSE](LICENSE) file for deta
 
 <div align="center">
 
-### 🌟 **Star us on GitHub** • 🐛 **Report Issues** • 💬 **Join Discussions**
+### **Star us on GitHub** • **Report Issues** • **Join Discussions**
 
-**Built with ❤️ by the tRPC-Agent-Go team**
+**Built with love by the tRPC-Agent-Go team**
 
 _Empowering developers to build the next generation of intelligent applications_
 
