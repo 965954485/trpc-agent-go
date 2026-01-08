@@ -262,10 +262,44 @@ func WithResume(enabled bool) RunOption {
 	}
 }
 
+// WithGraphEmitFinalModelResponses controls whether graph-based agents emit
+// final (Done=true) model responses as events.
+//
+// When disabled (default), graph Large Language Model (LLM) nodes only emit
+// streaming chunks (Done=false), which matches the pre-#901 behavior.
+func WithGraphEmitFinalModelResponses(enabled bool) RunOption {
+	return func(opts *RunOptions) {
+		opts.GraphEmitFinalModelResponses = enabled
+	}
+}
+
 // WithRequestID sets the request id for the RunOptions.
 func WithRequestID(requestID string) RunOption {
 	return func(opts *RunOptions) {
 		opts.RequestID = requestID
+	}
+}
+
+// WithDetachedCancel enables running a job that ignores parent context
+// cancellation.
+//
+// When enabled, Runner will remove the cancellation signal from the
+// execution context while still preserving context values and enforcing
+// timeouts and deadlines.
+func WithDetachedCancel(enabled bool) RunOption {
+	return func(opts *RunOptions) {
+		opts.DetachedCancel = enabled
+	}
+}
+
+// WithMaxRunDuration sets the maximum duration for a single run.
+//
+// Runner will enforce the smaller of:
+//   - the parent context deadline (if any)
+//   - MaxRunDuration (if > 0)
+func WithMaxRunDuration(d time.Duration) RunOption {
+	return func(opts *RunOptions) {
+		opts.MaxRunDuration = d
 	}
 }
 
@@ -458,8 +492,32 @@ type RunOptions struct {
 	// LLM request.
 	Resume bool
 
+	// GraphEmitFinalModelResponses controls event emission for graph-based
+	// Large Language Model (LLM) nodes.
+	//
+	// When false (default), graph LLM nodes only emit streaming chunks
+	// (Done=false).
+	//
+	// When true, graph LLM nodes also emit the final model response
+	// (Done=true). In that mode, callers should be prepared to receive
+	// assistant messages from intermediate nodes.
+	//
+	// When enabled, Runner may omit echoing the final assistant message
+	// in its runner-completion event to avoid duplicates.
+	GraphEmitFinalModelResponses bool
+
 	// RequestID is the request id of the request.
 	RequestID string
+
+	// DetachedCancel controls whether Runner ignores parent context
+	// cancellation for this run.
+	DetachedCancel bool
+
+	// MaxRunDuration bounds the total execution time for this run.
+	// When set, Runner enforces the smaller of:
+	//   - the parent context deadline (if any)
+	//   - MaxRunDuration
+	MaxRunDuration time.Duration
 
 	// SpanAttributes carries custom span attributes for this run.
 	SpanAttributes []attribute.KeyValue

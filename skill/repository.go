@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -71,7 +72,17 @@ type FSRepository struct {
 
 // NewFSRepository creates a FSRepository scanning the given roots.
 func NewFSRepository(roots ...string) (*FSRepository, error) {
-	r := &FSRepository{roots: roots, index: map[string]string{}}
+	resolved := make([]string, 0, len(roots))
+	for _, root := range roots {
+		p, err := resolveSkillsRoot(root)
+		if err != nil {
+			return nil, err
+		}
+		if p != "" {
+			resolved = append(resolved, p)
+		}
+	}
+	r := &FSRepository{roots: resolved, index: map[string]string{}}
 	if err := r.scan(); err != nil {
 		return nil, err
 	}
@@ -161,31 +172,41 @@ func (r *FSRepository) Get(name string) (*Skill, error) {
 	if sum.Name == "" {
 		sum.Name = name
 	}
-	docs := make([]Doc, 0)
-	entries, err := os.ReadDir(dir)
-	if err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			n := e.Name()
-			if strings.EqualFold(n, skillFile) {
-				continue
-			}
-			if !isDocFile(n) {
-				continue
-			}
-			b, err2 := os.ReadFile(filepath.Join(dir, n))
-			if err2 != nil {
-				continue
-			}
-			docs = append(docs, Doc{
-				Path:    n,
-				Content: string(b),
-			})
-		}
-	}
+	docs := r.readDocs(dir)
 	return &Skill{Summary: sum, Body: body, Docs: docs}, nil
+}
+
+func (r *FSRepository) readDocs(dir string) []Doc {
+	var docs []Doc
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry,
+		err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(d.Name(), skillFile) {
+			return nil
+		}
+		if !isDocFile(d.Name()) {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		docs = append(docs, Doc{
+			Path:    filepath.ToSlash(rel),
+			Content: string(b),
+		})
+		return nil
+	})
+	sort.Slice(docs, func(i, j int) bool {
+		return docs[i].Path < docs[j].Path
+	})
+	return docs
 }
 
 // parseSummary returns front matter name/description only.

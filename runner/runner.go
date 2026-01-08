@@ -95,6 +95,35 @@ type Runner interface {
 	Close() error
 }
 
+// ManagedRunner extends Runner with run control APIs.
+//
+// RequestID is used as the run identifier.
+//
+// If the caller does not set a request ID via agent.WithRequestID,
+// Runner will generate one and inject it into every emitted event.
+type ManagedRunner interface {
+	Runner
+
+	// Cancel cancels a running invocation by request ID.
+	// It returns true if a matching run was found.
+	Cancel(requestID string) bool
+
+	// RunStatus returns the current status for a running invocation.
+	// It returns false when the request ID is unknown or the run completed.
+	RunStatus(requestID string) (RunStatus, bool)
+}
+
+// RunStatus is a snapshot of a running invocation.
+type RunStatus struct {
+	RequestID    string
+	InvocationID string
+	AgentName    string
+	SessionKey   session.Key
+	StartedAt    time.Time
+	LastEventAt  time.Time
+	EventCount   int
+}
+
 // runner runs agents.
 type runner struct {
 	appName          string
@@ -108,6 +137,16 @@ type runner struct {
 	// Resource management fields.
 	ownedSessionService bool      // Indicates if sessionService was created by this runner.
 	closeOnce           sync.Once // Ensures Close is called only once.
+
+	runsMu sync.RWMutex
+	runs   map[string]*runHandle
+}
+
+type runHandle struct {
+	cancel context.CancelFunc
+
+	mu     sync.RWMutex
+	status RunStatus
 }
 
 // Options is the options for the Runner.
@@ -169,6 +208,7 @@ func NewRunner(appName string, ag agent.Agent, opts ...Option) Runner {
 func (r *runner) Close() error {
 	var closeErr error
 	r.closeOnce.Do(func() {
+		r.cancelAllRuns()
 		if r.pluginManager != nil {
 			if err := r.pluginManager.Close(context.Background()); err != nil {
 				closeErr = err
@@ -186,6 +226,26 @@ func (r *runner) Close() error {
 	return closeErr
 }
 
+func (r *runner) cancelAllRuns() {
+	r.runsMu.Lock()
+	if len(r.runs) == 0 {
+		r.runsMu.Unlock()
+		return
+	}
+	cancels := make([]context.CancelFunc, 0, len(r.runs))
+	for requestID, handle := range r.runs {
+		if handle != nil && handle.cancel != nil {
+			cancels = append(cancels, handle.cancel)
+		}
+		delete(r.runs, requestID)
+	}
+	r.runsMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 // Run runs the agent.
 func (r *runner) Run(
 	ctx context.Context,
@@ -194,6 +254,16 @@ func (r *runner) Run(
 	message model.Message,
 	runOpts ...agent.RunOption,
 ) (<-chan *event.Event, error) {
+	ro := agent.RunOptions{RequestID: uuid.NewString()}
+	for _, opt := range runOpts {
+		opt(&ro)
+	}
+	if ro.RequestID == "" {
+		ro.RequestID = uuid.NewString()
+	}
+
+	execCtx, execCancel := r.newExecutionContext(ctx, ro)
+
 	// Resolve or create the session for this user and conversation.
 	sessionKey := session.Key{
 		AppName:   r.appName,
@@ -201,19 +271,15 @@ func (r *runner) Run(
 		SessionID: sessionID,
 	}
 
-	sess, err := r.getOrCreateSession(ctx, sessionKey)
+	sess, err := r.getOrCreateSession(execCtx, sessionKey)
 	if err != nil {
+		execCancel()
 		return nil, err
 	}
 
-	// Build run options with defaults and construct the invocation.
-	ro := agent.RunOptions{RequestID: uuid.NewString()}
-	for _, opt := range runOpts {
-		opt(&ro)
-	}
-
-	ag, err := r.selectAgent(ctx, ro)
+	ag, err := r.selectAgent(execCtx, ro)
 	if err != nil {
+		execCancel()
 		return nil, fmt.Errorf("select agent: %w", err)
 	}
 
@@ -227,6 +293,22 @@ func (r *runner) Run(
 		agent.WithInvocationEventFilterKey(r.appName),
 		agent.WithInvocationPlugins(r.pluginManager),
 	)
+
+	handle, err := r.registerRun(
+		ro.RequestID,
+		RunStatus{
+			RequestID:    ro.RequestID,
+			InvocationID: invocation.InvocationID,
+			AgentName:    ag.Info().Name,
+			SessionKey:   sessionKey,
+			StartedAt:    time.Now(),
+		},
+		execCancel,
+	)
+	if err != nil {
+		execCancel()
+		return nil, err
+	}
 
 	// If caller provided a history via RunOptions and the session is empty,
 	// persist that history into the session exactly once, so subsequent turns
@@ -244,9 +326,16 @@ func (r *runner) Run(
 				&model.Response{Done: false, Choices: []model.Choice{{Index: 0, Message: m}}},
 			)
 			agent.InjectIntoEvent(invocation, seedEvt)
-			seedEvt = r.applyEventPlugins(ctx, invocation, seedEvt)
-			if err := r.sessionService.AppendEvent(ctx, sess, seedEvt); err != nil {
-				return nil, err
+			seedEvt = r.applyEventPlugins(execCtx, invocation, seedEvt)
+			appendErr := r.sessionService.AppendEvent(
+				execCtx,
+				sess,
+				seedEvt,
+			)
+			if appendErr != nil {
+				r.unregisterRun(ro.RequestID)
+				execCancel()
+				return nil, appendErr
 			}
 		}
 	}
@@ -259,8 +348,10 @@ func (r *runner) Run(
 			&model.Response{Done: false, Choices: []model.Choice{{Index: 0, Message: message}}},
 		)
 		agent.InjectIntoEvent(invocation, evt)
-		evt = r.applyEventPlugins(ctx, invocation, evt)
-		if err := r.sessionService.AppendEvent(ctx, sess, evt); err != nil {
+		evt = r.applyEventPlugins(execCtx, invocation, evt)
+		if err := r.sessionService.AppendEvent(execCtx, sess, evt); err != nil {
+			r.unregisterRun(ro.RequestID)
+			execCancel()
 			return nil, err
 		}
 	}
@@ -268,11 +359,11 @@ func (r *runner) Run(
 	// Ensure the invocation can be accessed by downstream components (e.g., tools)
 	// by embedding it into the context. This is necessary for tools like
 	// transfer_to_agent that rely on agent.InvocationFromContext(ctx).
-	ctx = agent.NewInvocationContext(ctx, invocation)
+	execCtx = agent.NewInvocationContext(execCtx, invocation)
 
 	// Create flush channel and attach flusher before agent.Run to ensure cloned invocations inherit it.
 	flushChan := make(chan *flush.FlushRequest)
-	flush.Attach(ctx, invocation, flushChan)
+	flush.Attach(execCtx, invocation, flushChan)
 	appender.Attach(invocation, func(ctx context.Context, e *event.Event) error {
 		if e == nil {
 			return nil
@@ -282,7 +373,7 @@ func (r *runner) Run(
 	barrier.Enable(invocation)
 
 	// Run the agent and get the event channel.
-	agentEventCh, err := agent.RunWithPlugins(ctx, invocation, ag)
+	agentEventCh, err := agent.RunWithPlugins(execCtx, invocation, ag)
 	if err != nil {
 		// Attempt to persist the error event so the session reflects the failure.
 		errorEvent := event.NewErrorEvent(
@@ -293,18 +384,133 @@ func (r *runner) Run(
 		)
 		// Populate content to ensure it is valid for persistence (and viewable by users).
 		ensureErrorEventContent(errorEvent)
-		errorEvent = r.applyEventPlugins(ctx, invocation, errorEvent)
+		errorEvent = r.applyEventPlugins(execCtx, invocation, errorEvent)
 
-		if appendErr := r.sessionService.AppendEvent(ctx, sess, errorEvent); appendErr != nil {
+		appendErr := r.sessionService.AppendEvent(execCtx, sess, errorEvent)
+		if appendErr != nil {
 			log.Errorf("failed to append agent run error event: %v", appendErr)
 		}
 
-		invocation.CleanupNotice(ctx)
+		r.unregisterRun(ro.RequestID)
+		execCancel()
+		invocation.CleanupNotice(execCtx)
 		return nil, err
 	}
 
 	// Process the agent events and emit them to the output channel.
-	return r.processAgentEvents(ctx, sess, invocation, agentEventCh, flushChan), nil
+	return r.processAgentEvents(
+		execCtx,
+		sess,
+		invocation,
+		agentEventCh,
+		flushChan,
+		handle,
+	), nil
+}
+
+func (r *runner) Cancel(requestID string) bool {
+	cancel := r.lookupCancel(requestID)
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (r *runner) RunStatus(requestID string) (RunStatus, bool) {
+	handle := r.lookupRun(requestID)
+	if handle == nil {
+		return RunStatus{}, false
+	}
+	handle.mu.RLock()
+	defer handle.mu.RUnlock()
+	return handle.status, true
+}
+
+func (r *runner) newExecutionContext(
+	ctx context.Context,
+	ro agent.RunOptions,
+) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	timeout := ro.MaxRunDuration
+	hasTimeout := timeout > 0
+	deadline, ok := ctx.Deadline()
+	if ok {
+		remaining := time.Until(deadline)
+		if remaining < 0 {
+			remaining = 0
+		}
+		if !hasTimeout || remaining < timeout {
+			timeout = remaining
+		}
+		hasTimeout = true
+	}
+
+	execCtx := agent.CloneContext(ctx)
+	if ro.DetachedCancel {
+		execCtx = context.WithoutCancel(execCtx)
+	}
+	if hasTimeout {
+		return context.WithTimeout(execCtx, timeout)
+	}
+	return context.WithCancel(execCtx)
+}
+
+func (r *runner) registerRun(
+	requestID string,
+	status RunStatus,
+	cancel context.CancelFunc,
+) (*runHandle, error) {
+	if requestID == "" {
+		return nil, fmt.Errorf("runner: empty request id")
+	}
+	if cancel == nil {
+		return nil, fmt.Errorf("runner: nil cancel function")
+	}
+
+	r.runsMu.Lock()
+	defer r.runsMu.Unlock()
+	if r.runs == nil {
+		r.runs = make(map[string]*runHandle)
+	}
+	if _, ok := r.runs[requestID]; ok {
+		return nil, fmt.Errorf(
+			"runner: request id %q already running",
+			requestID,
+		)
+	}
+	handle := &runHandle{cancel: cancel, status: status}
+	r.runs[requestID] = handle
+	return handle, nil
+}
+
+func (r *runner) unregisterRun(requestID string) {
+	if requestID == "" {
+		return
+	}
+	r.runsMu.Lock()
+	defer r.runsMu.Unlock()
+	delete(r.runs, requestID)
+}
+
+func (r *runner) lookupRun(requestID string) *runHandle {
+	if requestID == "" {
+		return nil
+	}
+	r.runsMu.RLock()
+	defer r.runsMu.RUnlock()
+	return r.runs[requestID]
+}
+
+func (r *runner) lookupCancel(requestID string) context.CancelFunc {
+	handle := r.lookupRun(requestID)
+	if handle == nil {
+		return nil
+	}
+	return handle.cancel
 }
 
 // resolveAgent decides which agent to use for this run.
@@ -347,9 +553,15 @@ type eventLoopContext struct {
 	agentEventCh     <-chan *event.Event
 	flushChan        chan *flush.FlushRequest
 	processedEventCh chan *event.Event
+	runHandle        *runHandle
 	finalStateDelta  map[string][]byte
 	finalChoices     []model.Choice
-	assistantContent map[string]struct{}
+	// emittedAssistantResponseIDs tracks response IDs that already produced a
+	// non-partial assistant message event during this run.
+	//
+	// It is used to avoid echoing the same final assistant message again in the
+	// runner-completion event when graph final model responses are emitted.
+	emittedAssistantResponseIDs map[string]struct{}
 }
 
 // processAgentEvents consumes agent events, persists to session, and emits.
@@ -359,6 +571,7 @@ func (r *runner) processAgentEvents(
 	invocation *agent.Invocation,
 	agentEventCh <-chan *event.Event,
 	flushChan chan *flush.FlushRequest,
+	handle *runHandle,
 ) chan *event.Event {
 	processedEventCh := make(chan *event.Event, cap(agentEventCh))
 	loop := &eventLoopContext{
@@ -367,7 +580,7 @@ func (r *runner) processAgentEvents(
 		agentEventCh:     agentEventCh,
 		flushChan:        flushChan,
 		processedEventCh: processedEventCh,
-		assistantContent: make(map[string]struct{}),
+		runHandle:        handle,
 	}
 	runCtx := agent.CloneContext(ctx)
 	go r.runEventLoop(runCtx, loop)
@@ -387,6 +600,10 @@ func (r *runner) runEventLoop(ctx context.Context, loop *eventLoopContext) {
 		appender.Clear(loop.invocation)
 		close(loop.processedEventCh)
 		loop.invocation.CleanupNotice(ctx)
+		r.unregisterRun(loop.invocation.RunOptions.RequestID)
+		if loop.runHandle != nil {
+			loop.runHandle.cancel()
+		}
 	}()
 	for {
 		select {
@@ -428,7 +645,7 @@ func (r *runner) processSingleAgentEvent(ctx context.Context, loop *eventLoopCon
 
 	agentEvent = r.applyEventPlugins(ctx, loop.invocation, agentEvent)
 
-	r.recordAssistantContent(loop, agentEvent)
+	r.recordEmittedAssistantResponseID(loop, agentEvent)
 
 	// Append qualifying events to session and trigger summarization.
 	r.handleEventPersistence(ctx, loop.sess, agentEvent)
@@ -448,8 +665,20 @@ func (r *runner) processSingleAgentEvent(ctx context.Context, loop *eventLoopCon
 	if err := event.EmitEvent(ctx, loop.processedEventCh, agentEvent); err != nil {
 		return fmt.Errorf("emit event to output channel: %w", err)
 	}
+	r.recordRunEvent(loop)
 
 	return nil
+}
+
+func (r *runner) recordRunEvent(loop *eventLoopContext) {
+	if loop == nil || loop.runHandle == nil {
+		return
+	}
+	handle := loop.runHandle
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+	handle.status.LastEventAt = time.Now()
+	handle.status.EventCount++
 }
 
 func (r *runner) applyEventPlugins(
@@ -496,20 +725,26 @@ func copyEventInvocationFields(dst *event.Event, src *event.Event) {
 	}
 }
 
-func (r *runner) recordAssistantContent(loop *eventLoopContext, e *event.Event) {
+func (r *runner) recordEmittedAssistantResponseID(
+	loop *eventLoopContext,
+	e *event.Event,
+) {
 	if loop == nil || e == nil || e.Response == nil {
 		return
 	}
 	if loop.invocation == nil {
 		return
 	}
-	if loop.assistantContent == nil {
-		loop.assistantContent = make(map[string]struct{})
+	if !loop.invocation.RunOptions.GraphEmitFinalModelResponses {
+		return
 	}
 	if isGraphCompletionEvent(e) {
 		return
 	}
 	if e.IsPartial || !e.IsValidContent() {
+		return
+	}
+	if e.Response.ID == "" {
 		return
 	}
 	for _, choice := range e.Response.Choices {
@@ -520,7 +755,11 @@ func (r *runner) recordAssistantContent(loop *eventLoopContext, e *event.Event) 
 		if msg.Content == "" {
 			continue
 		}
-		loop.assistantContent[msg.Content] = struct{}{}
+		if loop.emittedAssistantResponseIDs == nil {
+			loop.emittedAssistantResponseIDs = make(map[string]struct{})
+		}
+		loop.emittedAssistantResponseIDs[e.Response.ID] = struct{}{}
+		return
 	}
 }
 
@@ -672,12 +911,12 @@ func (r *runner) emitRunnerCompletion(ctx context.Context, loop *eventLoopContex
 
 	// Propagate graph-level completion data if available.
 	if len(loop.finalStateDelta) > 0 {
-		includeChoices := r.shouldIncludeFinalChoices(loop)
+		echoFinalChoices := r.shouldEchoFinalChoicesInCompletion(loop)
 		r.propagateGraphCompletion(
 			runnerCompletionEvent,
 			loop.finalStateDelta,
 			loop.finalChoices,
-			includeChoices,
+			echoFinalChoices,
 		)
 	}
 
@@ -696,7 +935,7 @@ func (r *runner) propagateGraphCompletion(
 	runnerCompletionEvent *event.Event,
 	finalStateDelta map[string][]byte,
 	finalChoices []model.Choice,
-	includeChoices bool,
+	echoFinalChoices bool,
 ) {
 	// Initialize state delta map if needed.
 	if runnerCompletionEvent.StateDelta == nil {
@@ -716,7 +955,7 @@ func (r *runner) propagateGraphCompletion(
 
 	// Optionally echo the final text as a non-streaming assistant message
 	// if graph provided it in its completion.
-	if includeChoices &&
+	if echoFinalChoices &&
 		runnerCompletionEvent.Response != nil &&
 		len(runnerCompletionEvent.Response.Choices) == 0 &&
 		len(finalChoices) > 0 {
@@ -727,29 +966,56 @@ func (r *runner) propagateGraphCompletion(
 	}
 }
 
-func (r *runner) shouldIncludeFinalChoices(loop *eventLoopContext) bool {
+// shouldEchoFinalChoicesInCompletion decides whether Runner should copy the
+// graph's final assistant message into the runner-completion event.
+//
+// Default behavior: Graph Large Language Model (LLM) nodes do not emit the
+// final (Done=true) assistant response event. In that mode, Runner must echo
+// the final choices so clients can reliably read the final answer.
+//
+// When GraphEmitFinalModelResponses is enabled, graph LLM nodes emit final
+// (Done=true) assistant response events. In that mode, Runner will skip
+// echoing final choices if it can match the graph's last response identifier
+// (ID) to a response ID that was already emitted, avoiding duplicates.
+func (r *runner) shouldEchoFinalChoicesInCompletion(
+	loop *eventLoopContext,
+) bool {
 	if loop == nil {
 		return true
 	}
 	if len(loop.finalChoices) == 0 {
 		return false
 	}
-	if len(loop.assistantContent) == 0 {
+	if loop.invocation == nil {
 		return true
 	}
-	for _, choice := range loop.finalChoices {
-		msg := choice.Message
-		if msg.Role != model.RoleAssistant {
-			continue
-		}
-		if msg.Content == "" {
-			continue
-		}
-		if _, ok := loop.assistantContent[msg.Content]; ok {
-			return false
-		}
+
+	if !loop.invocation.RunOptions.GraphEmitFinalModelResponses {
+		return true
 	}
-	return true
+
+	finalResponseID := finalResponseIDFromStateDelta(loop.finalStateDelta)
+	if finalResponseID == "" {
+		return true
+	}
+
+	_, alreadyEmitted := loop.emittedAssistantResponseIDs[finalResponseID]
+	return !alreadyEmitted
+}
+
+func finalResponseIDFromStateDelta(finalStateDelta map[string][]byte) string {
+	if finalStateDelta == nil {
+		return ""
+	}
+	raw, ok := finalStateDelta[graph.StateKeyLastResponseID]
+	if !ok || len(raw) == 0 {
+		return ""
+	}
+	var responseID string
+	if err := json.Unmarshal(raw, &responseID); err != nil {
+		return ""
+	}
+	return responseID
 }
 
 // shouldAppendUserMessage checks if the incoming user message should be appended to the session.

@@ -12,6 +12,7 @@ package agent
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/model"
@@ -87,6 +88,25 @@ func TestWithRequestID(t *testing.T) {
 	}
 }
 
+func TestWithDetachedCancel(t *testing.T) {
+	var ro RunOptions
+	WithDetachedCancel(true)(&ro)
+	require.True(t, ro.DetachedCancel)
+
+	WithDetachedCancel(false)(&ro)
+	require.False(t, ro.DetachedCancel)
+}
+
+func TestWithMaxRunDuration(t *testing.T) {
+	const (
+		maxRun = time.Second
+	)
+
+	var ro RunOptions
+	WithMaxRunDuration(maxRun)(&ro)
+	require.Equal(t, maxRun, ro.MaxRunDuration)
+}
+
 func TestWithA2ARequestOptions(t *testing.T) {
 	tests := []struct {
 		name string
@@ -149,6 +169,15 @@ func TestWithResume(t *testing.T) {
 
 	WithResume(false)(&ro)
 	require.False(t, ro.Resume)
+}
+
+func TestWithGraphEmitFinalModelResponses(t *testing.T) {
+	var ro RunOptions
+	WithGraphEmitFinalModelResponses(true)(&ro)
+	require.True(t, ro.GraphEmitFinalModelResponses)
+
+	WithGraphEmitFinalModelResponses(false)(&ro)
+	require.False(t, ro.GraphEmitFinalModelResponses)
 }
 
 type stubTool struct {

@@ -11,10 +11,14 @@ package graph
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -306,9 +310,10 @@ func WithAgentNodeEventCallback(callback AgentEventCallback) Option {
 // decoding, which may coerce numbers to float64 and complex structures to
 // map[string]any.
 type SubgraphResult struct {
-	LastResponse  string
-	FinalState    State
-	RawStateDelta map[string][]byte
+	LastResponse     string
+	FinalState       State
+	RawStateDelta    map[string][]byte
+	StructuredOutput any // Structured output from sub-agent (typed struct or untyped map)
 }
 
 // SubgraphInputMapper projects parent state into child runtime state.
@@ -475,6 +480,11 @@ func (sg *StateGraph) AddSubgraphNode(id string, opts ...Option) *StateGraph {
 // channelUpdateMarker value for marking channel updates.
 const channelUpdateMarker = "update"
 
+const (
+	joinChannelFromSeparator = ":from:"
+	joinKeyLenBytes          = 8
+)
+
 // AddEdge adds a normal edge between two nodes.
 // This automatically sets up Pregel-style channel configuration.
 func (sg *StateGraph) AddEdge(from, to string) *StateGraph {
@@ -496,6 +506,78 @@ func (sg *StateGraph) AddEdge(from, to string) *StateGraph {
 	}
 	sg.graph.addNodeWriter(from, writer)
 	return sg
+}
+
+// AddJoinEdge adds a join edge that waits for all start nodes to complete
+// before triggering the end node.
+func (sg *StateGraph) AddJoinEdge(fromNodes []string, to string) *StateGraph {
+	starts := normalizeJoinStarts(fromNodes)
+	if to == "" || to == Start || len(starts) == 0 {
+		return sg
+	}
+
+	for _, from := range starts {
+		edge := &Edge{
+			From: from,
+			To:   to,
+		}
+		sg.graph.addEdge(edge)
+	}
+
+	channelName := joinChannelName(to, starts)
+
+	sg.graph.addChannel(channelName, channel.BehaviorBarrier)
+	if ch, ok := sg.graph.getChannel(channelName); ok && ch != nil {
+		ch.SetBarrierExpected(starts)
+	}
+
+	sg.graph.addNodeTriggerChannel(to, channelName)
+	sg.graph.addNodeTrigger(channelName, to)
+
+	for _, from := range starts {
+		writer := channelWriteEntry{
+			Channel: channelName,
+			Value:   from,
+		}
+		sg.graph.addNodeWriter(from, writer)
+	}
+	return sg
+}
+
+func joinChannelName(to string, starts []string) string {
+	joinKey := joinKeyForStarts(starts)
+	return ChannelJoinPrefix + to + joinChannelFromSeparator + joinKey
+}
+
+func joinKeyForStarts(starts []string) string {
+	h := sha256.New()
+	for _, start := range starts {
+		var lenBuf [joinKeyLenBytes]byte
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(start)))
+		_, _ = h.Write(lenBuf[:])
+		_, _ = h.Write([]byte(start))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func normalizeJoinStarts(fromNodes []string) []string {
+	if len(fromNodes) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(fromNodes))
+	out := make([]string, 0, len(fromNodes))
+	for _, from := range fromNodes {
+		if from == "" || from == Start || from == End {
+			continue
+		}
+		if seen[from] {
+			continue
+		}
+		seen[from] = true
+		out = append(out, from)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // AddConditionalEdges adds conditional routing from a node.
@@ -944,23 +1026,35 @@ func (r *llmRunner) executeModel(
 	return result, err
 }
 
-// processInstruction resolves placeholder variables in the instruction using
-// the session state present in the graph state (if any). It supports keys like
-// {user:...}, {app:...}, and optional suffix {?} consistent with llmagent.
+// processInstruction resolves placeholder variables in the instruction.
+// It supports the same syntax as LLMAgent, including {invocation:*} values
+// stored on the current invocation.
 func (r *llmRunner) processInstruction(state State) string {
 	instr := r.instruction
 	if instr == "" {
 		return instr
 	}
-	// Extract session from graph state.
-	if sessVal, ok := state[StateKeySession]; ok {
-		if sess, ok := sessVal.(*session.Session); ok && sess != nil {
-			// Build a minimal invocation carrying only the session for injection.
-			inv := agent.NewInvocation(agent.WithInvocationSession(sess))
-			if injected, err := stateinject.InjectSessionState(instr, inv); err == nil {
-				return injected
-			}
+
+	var invocation *agent.Invocation
+	if execVal, ok := state[StateKeyExecContext]; ok {
+		if execCtx, ok := execVal.(*ExecutionContext); ok && execCtx != nil {
+			invocation = execCtx.Invocation
 		}
+	}
+
+	var sess *session.Session
+	if sessVal, ok := state[StateKeySession]; ok {
+		if s, ok := sessVal.(*session.Session); ok {
+			sess = s
+		}
+	}
+
+	if injected, err := stateinject.InjectSessionStateWithSession(
+		instr,
+		invocation,
+		sess,
+	); err == nil {
+		return injected
 	}
 	return instr
 }
@@ -1118,7 +1212,8 @@ func emitModelResponseEvent(
 	config modelResponseConfig,
 	ev *event.Event,
 ) error {
-	if config.EventChan == nil || !shouldEmitModelResponse(config.Response) {
+	if config.EventChan == nil ||
+		!shouldEmitModelResponseEvent(ctx, config.Response) {
 		return nil
 	}
 
@@ -1133,6 +1228,22 @@ func emitModelResponseEvent(
 		)
 	}
 	return agent.EmitEvent(ctx, invocation, config.EventChan, ev)
+}
+
+func shouldEmitModelResponseEvent(
+	ctx context.Context,
+	rsp *model.Response,
+) bool {
+	if rsp == nil {
+		return false
+	}
+	invocation, ok := agent.InvocationFromContext(ctx)
+	if ok &&
+		invocation != nil &&
+		invocation.RunOptions.GraphEmitFinalModelResponses {
+		return shouldEmitModelResponse(rsp)
+	}
+	return !rsp.Done
 }
 
 // processModelResponse processes a single model response.
@@ -1347,9 +1458,37 @@ func NewToolsNodeFunc(tools map[string]tool.Tool, opts ...Option) NodeFunc {
 		if err != nil {
 			return nil, err
 		}
-		return State{
-			StateKeyMessages: newMessages,
-		}, nil
+		upd := State{StateKeyMessages: newMessages}
+
+		if len(newMessages) > 0 {
+			upd[StateKeyLastToolResponse] =
+				newMessages[len(newMessages)-1].Content
+		}
+
+		nodeID, _ := GetStateValue[string](state, StateKeyCurrentNodeID)
+		if nodeID != "" {
+			type toolNodeResponse struct {
+				ToolID   string          `json:"tool_id"`
+				ToolName string          `json:"tool_name"`
+				Output   json.RawMessage `json:"output"`
+			}
+
+			responses := make([]toolNodeResponse, 0, len(newMessages))
+			for _, msg := range newMessages {
+				responses = append(responses, toolNodeResponse{
+					ToolID:   msg.ToolID,
+					ToolName: msg.ToolName,
+					Output:   json.RawMessage(msg.Content),
+				})
+			}
+
+			b, _ := json.Marshal(responses)
+			upd[StateKeyNodeResponses] = map[string]any{
+				nodeID: string(b),
+			}
+		}
+
+		return upd, nil
 	}
 }
 
@@ -1485,7 +1624,7 @@ func NewAgentNodeFunc(agentName string, opts ...Option) NodeFunc {
 		}
 
 		// Process agent event stream and capture completion state.
-		lastResponse, finalState, rawDelta, fullRespEvent, tokenUsage, err := processAgentEventStream(
+		lastResponse, finalState, rawDelta, structuredOutput, fullRespEvent, tokenUsage, err := processAgentEventStream(
 			ctx, agentEventChan, nodeCallbacks, nodeID, state, eventChan, agentName, tracker,
 		)
 		if err != nil {
@@ -1498,7 +1637,12 @@ func NewAgentNodeFunc(agentName string, opts ...Option) NodeFunc {
 		emitAgentCompleteEvent(ctx, eventChan, invocationID, nodeID, startTime, endTime)
 		// Update state with either custom output mapping or default behavior.
 		if outputMapper != nil {
-			mapped := outputMapper(state, SubgraphResult{LastResponse: lastResponse, FinalState: finalState, RawStateDelta: rawDelta})
+			mapped := outputMapper(state, SubgraphResult{
+				LastResponse:     lastResponse,
+				FinalState:       finalState,
+				RawStateDelta:    rawDelta,
+				StructuredOutput: structuredOutput,
+			})
 			if mapped != nil {
 				return mapped, nil
 			}
@@ -1523,10 +1667,11 @@ func processAgentEventStream(
 	eventChan chan<- *event.Event,
 	agentName string,
 	tracker *itelemetry.InvokeAgentTracker,
-) (string, State, map[string][]byte, *event.Event, *itelemetry.TokenUsage, error) {
+) (string, State, map[string][]byte, any, *event.Event, *itelemetry.TokenUsage, error) {
 	var lastResponse string
 	var finalState State
 	var rawDelta map[string][]byte
+	var structuredOutput any
 	var fullRespEvent *event.Event
 	tokenUsage := &itelemetry.TokenUsage{}
 
@@ -1543,13 +1688,18 @@ func processAgentEventStream(
 
 		// Forward the event to the parent event channel.
 		if err := event.EmitEvent(ctx, eventChan, agentEvent); err != nil {
-			return "", nil, nil, fullRespEvent, tokenUsage, err
+			return "", nil, nil, nil, fullRespEvent, tokenUsage, err
 		}
 
 		// Track the last response for state update.
 		if agentEvent.Response != nil && len(agentEvent.Response.Choices) > 0 &&
 			agentEvent.Response.Choices[0].Message.Content != "" {
 			lastResponse = agentEvent.Response.Choices[0].Message.Content
+		}
+
+		// Capture structured output from state.update events.
+		if agentEvent.StructuredOutput != nil {
+			structuredOutput = agentEvent.StructuredOutput
 		}
 
 		if agentEvent.Response != nil {
@@ -1590,7 +1740,7 @@ func processAgentEventStream(
 		}
 	}
 
-	return lastResponse, finalState, rawDelta, fullRespEvent, tokenUsage, nil
+	return lastResponse, finalState, rawDelta, structuredOutput, fullRespEvent, tokenUsage, nil
 }
 
 // buildAgentInvocationWithStateAndScope builds an invocation for the target agent
@@ -1685,6 +1835,7 @@ func runBeforeToolPluginCallbacks(
 	}
 
 	args := &tool.BeforeToolArgs{
+		ToolCallID:  toolCall.ID,
 		ToolName:    toolCall.Function.Name,
 		Declaration: decl,
 		Arguments:   toolCall.Function.Arguments,
@@ -1718,6 +1869,7 @@ func runBeforeToolCallbacks(
 	}
 
 	args := &tool.BeforeToolArgs{
+		ToolCallID:  toolCall.ID,
 		ToolName:    toolCall.Function.Name,
 		Declaration: decl,
 		Arguments:   toolCall.Function.Arguments,
@@ -1769,6 +1921,7 @@ func runAfterToolPluginCallbacks(
 	}
 
 	args := &tool.AfterToolArgs{
+		ToolCallID:  toolCall.ID,
 		ToolName:    toolCall.Function.Name,
 		Declaration: decl,
 		Arguments:   toolCall.Function.Arguments,
@@ -1802,6 +1955,7 @@ func runAfterToolCallbacks(
 	}
 
 	args := &tool.AfterToolArgs{
+		ToolCallID:  toolCall.ID,
 		ToolName:    toolCall.Function.Name,
 		Declaration: decl,
 		Arguments:   toolCall.Function.Arguments,
@@ -2442,6 +2596,10 @@ func MessagesStateSchema() *StateSchema {
 		Reducer: DefaultReducer,
 	})
 	schema.AddField(StateKeyLastResponse, StateField{
+		Type:    reflect.TypeOf(""),
+		Reducer: DefaultReducer,
+	})
+	schema.AddField(StateKeyLastToolResponse, StateField{
 		Type:    reflect.TypeOf(""),
 		Reducer: DefaultReducer,
 	})
